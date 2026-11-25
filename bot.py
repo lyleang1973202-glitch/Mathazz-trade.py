@@ -18736,5 +18736,220 @@ BUILD_LOG = [("V25.3", "Lyli Live Conversation Brain + Twelve Data snapshot cont
 
 
 
+
+# =============================================================================
+# V25.3.1 HOTFIX · LILY CHAT RECOVERY  (additive; later definitions win)
+#
+# ROOT CAUSES FIXED
+#  1) V25.3 mapped the "chat" topic onto "analyze". `/topic set chat` therefore
+#     OVERWROTE the Analyze topic, while Lily listens for category='chat' only
+#     -> Lily stayed silent in groups, and Lily/Analyze messages landed in the
+#     wrong Topic. "chat" is a real category again (Lily listens + proactive
+#     Lily messages go there). Scan Zone rows saved as 'scanzone' are found again.
+#  2) Gold data was injected into questions that were not about gold
+#     (symbol defaulted to XAUUSD, generic words like "live"/"analyze"/"sl"/"tp").
+#     Live data is now attached only for the symbol the user actually names.
+#  3) Lily waited for 5 candle fetches + Claude + DeepSeek with no deadline
+#     (up to ~90 s) so it looked dead. Every prep step now has a time limit and
+#     Lily always answers, even if a provider fails.
+# =============================================================================
+_TOPIC_CATEGORIES = {
+    "instant": "⚡ INSTANT",
+    "analyze": "🧭 ANALYZE",
+    "ictpro": "👑 ICT PRO",
+    "ict": "📘 ICT",
+    "chat": "💬 LILY CHAT",
+}
+_TOPIC_ALIASES = {
+    "inst": "instant", "ana": "analyze",
+    "img": "analyze", "image": "analyze", "photo": "analyze", "chart": "analyze", "ai": "analyze",
+    "ask": "chat", "talk": "chat", "chat": "chat", "lily": "chat",
+    "pro": "ictpro", "ictpro": "ictpro",
+    "scan": "ict", "zone": "ict", "scanzone": "ict", "ict": "ict",
+}
+_TOPIC_LEGACY_NAMES = ("ict",)   # keeps _registry_subs("scanzone") reading both 'scanzone' and 'ict' rows
+
+
+def _topic_id_for(chat_id, category):
+    category = _topic_norm(category, "analyze")
+    # Old databases stored Scan Zone as 'scanzone'; V25.3 looks for 'ict' -> alerts fell back to General.
+    names = (category,) + (("scanzone",) if category == "ict" else ())
+    try:
+        with _pro_db() as con:
+            rows = con.execute(
+                "SELECT category,topic_id FROM alert_topic_registry WHERE chat_id=? AND category IN (%s)"
+                % ",".join("?" * len(names)), (int(chat_id),) + names).fetchall()
+        found = {c: t for c, t in rows}
+        for name in names:
+            if name in found:
+                return int(found[name])
+        return None
+    except Exception as exc:
+        print("Topic lookup warning:", type(exc).__name__, exc)
+        return None
+
+
+def _chat_topic_active(chat_id, thread_id):
+    """A Topic registered with /topic set chat -> Lily answers every message there."""
+    if not thread_id:
+        return False
+    try:
+        with _pro_db() as con:
+            row = con.execute("SELECT 1 FROM alert_topic_registry WHERE chat_id=? AND category='chat' AND topic_id=?",
+                              (int(chat_id), int(thread_id))).fetchone()
+        return bool(row)
+    except Exception as exc:
+        print("Lily chat topic lookup:", type(exc).__name__, exc)
+        return False
+
+
+# ---- symbol-aware live-data gating ------------------------------------------
+_LYLI_GOLD_WORDS_KH = ("មាស",)
+_LYLI_LIVE_INTENT = (
+    "price", "live", "now", "right now", "market", "quote", "spot", "analy", "bias", "trend",
+    "structure", "setup", "signal", "levels",
+    "តម្លៃ", "ឥឡូវ", "ពេលនេះ", "ទីផ្សារ", "វិភាគ", "សញ្ញា", "បច្ចុប្បន្ន",
+)
+
+
+def _lyli_mentioned_symbols(question):
+    syms = list(_chat_symbol_hint(question) or [])
+    q = str(question or "")
+    if "XAUUSD" not in syms and any(w in q for w in _LYLI_GOLD_WORDS_KH):
+        syms.append("XAUUSD")
+    return syms
+
+
+def _lyli_question_needs_live(q):
+    """Live data only when a real symbol is named AND the user asks about the market."""
+    low = str(q or "").lower()
+    if not _lyli_mentioned_symbols(q):
+        return False
+    return any(w in low for w in _LYLI_LIVE_INTENT)
+
+
+def _lyli_detect_symbol_tf(text_):
+    syms = _lyli_mentioned_symbols(text_)
+    symbol = syms[0] if syms else None          # never silently fall back to gold
+    q = str(text_ or "").upper()
+    tf = "M15"
+    for raw, norm in (("M1", "M1"), ("1M", "M1"), ("M5", "M5"), ("5M", "M5"),
+                      ("M15", "M15"), ("15M", "M15"), ("M30", "M30"), ("30M", "M30"),
+                      ("H1", "H1"), ("1H", "H1"), ("H4", "H4"), ("4H", "H4")):
+        if re.search(r"\b" + raw + r"\b", q):
+            tf = norm
+            break
+    return symbol, tf
+
+
+_LILY_PRICE_SHORT_WORDS = ("sl", "tp", "buy", "sell", "now", "bias", "live", "xau", "gold")
+
+
+def _lily_wants_price(question):
+    """Short tokens such as 'sl'/'tp' matched inside other words ('slow', 'http') and injected a gold price."""
+    q = (question or "").lower()
+    syms = _lyli_mentioned_symbols(question)
+    if syms and "XAUUSD" not in syms:
+        return False                            # the user asked about another instrument
+    for w in _LILY_PRICE_WORDS:
+        if w.isascii() and len(w) <= 4 and w.isalpha():
+            if re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", q):
+                return True
+        elif w in q:
+            return True
+    return False
+
+
+# ---- bounded work so Lily never looks dead -----------------------------------
+LYLI_CHAT_SNAPSHOT_TIMEOUT = max(5, int(os.environ.get("LYLI_CHAT_SNAPSHOT_TIMEOUT") or 15))
+LYLI_CHAT_REVIEW_TIMEOUT = max(5, int(os.environ.get("LYLI_CHAT_REVIEW_TIMEOUT") or 15))
+
+
+def _lyli_bounded(fn, timeout, *args):
+    """Run fn in a daemon thread; return (value, error). Never blocks longer than `timeout`."""
+    box = {}
+
+    def _run():
+        try:
+            box["v"] = fn(*args)
+        except Exception as exc:
+            box["e"] = exc
+
+    th = threading.Thread(target=_run, name="lyli-bounded", daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return None, "timeout after %ss" % timeout
+    if "e" in box:
+        return None, "%s: %s" % (type(box["e"]).__name__, str(box["e"])[:120])
+    return box.get("v"), None
+
+
+def _lyli_text_ai_reviews(question, snapshot):
+    """Claude + DeepSeek in parallel with a hard overall deadline (the old version could wait ~90 s)."""
+    if not LYLI_AI_FANOUT_ENABLED:
+        return {"claude": {"status": "disabled"}, "deepseek": {"status": "disabled"}}
+    out = {n: {"status": "timeout", "error": "no answer within %ss" % LYLI_CHAT_REVIEW_TIMEOUT}
+           for n in ("claude", "deepseek")}
+    lock = threading.Lock()
+
+    def _one(name):
+        res = _lyli_text_ai_one(name, question, snapshot)
+        with lock:
+            out[name] = res
+
+    threads = [threading.Thread(target=_one, args=(n,), daemon=True) for n in ("claude", "deepseek")]
+    for t in threads:
+        t.start()
+    deadline = time.time() + LYLI_CHAT_REVIEW_TIMEOUT
+    for t in threads:
+        t.join(max(0.1, deadline - time.time()))
+    with lock:
+        return dict(out)
+
+
+def chat_answer(chat_id, thread_id, user_id, question):
+    q = str(question or "")
+    _LYLI_CHAT_CTX.question = q
+    _LYLI_CHAT_CTX.snapshot = None
+    _LYLI_CHAT_CTX.ai_reviews = None
+    try:
+        try:
+            if LYLI_BRAIN_ENABLED and LYLI_LIVE_DATA_ENABLED and _lyli_question_needs_live(q):
+                symbol, _tf = _lyli_detect_symbol_tf(q)
+                if symbol and symbol in LYLI_ALLOWED_SYMBOLS:
+                    tg("sendChatAction", chat_id=chat_id, action="typing")
+                    snap, err = _lyli_bounded(_lyli_live_snapshot, LYLI_CHAT_SNAPSHOT_TIMEOUT,
+                                              symbol, LYLI_LIVE_TFS, False)
+                    if snap is None:
+                        snap = {"ok": False, "error": "market data fetch failed (%s)" % err, "rows": {}}
+                    if symbol == "XAUUSD" and snap.get("ok"):
+                        snap["alpha_crosscheck"], _e = _lyli_bounded(
+                            _lyli_alpha_gold_crosscheck, 8, snap.get("price"))
+                    _LYLI_CHAT_CTX.snapshot = snap
+                    tg("sendChatAction", chat_id=chat_id, action="typing")
+                    _LYLI_CHAT_CTX.ai_reviews = _lyli_text_ai_reviews(q, snap)
+                # symbol outside Lily's live scope -> no foreign data is injected; the normal chat flow
+                # (ask the user for the price) handles it.
+        except Exception as exc:
+            traceback.print_exc()
+            print("V25.3.1 live prep skipped:", type(exc).__name__, exc)
+            _LYLI_CHAT_CTX.snapshot = None
+            _LYLI_CHAT_CTX.ai_reviews = None
+        try:
+            return _LYLI_V253_OLD_CHAT_ANSWER(chat_id, thread_id, user_id, question)
+        except Exception as exc:
+            traceback.print_exc()
+            return ("⚠️ លីលីជួបបញ្ហាបច្ចេកទេសបន្តិច (%s)។ សូមសាកម្ដងទៀត។" % html.escape(type(exc).__name__))
+    finally:
+        _LYLI_CHAT_CTX.question = ""
+        _LYLI_CHAT_CTX.snapshot = None
+        _LYLI_CHAT_CTX.ai_reviews = None
+
+
+BUILD_VERSION = "V25.3.1 LYLI CHAT FIX · TOPIC + LIVE-DATA GATING"
+BUILD_LOG = [("V25.3.1", "Hotfix: 'chat' topic is a real category again (Lily answers in /topic set chat, no longer overwrites Analyze); Scan Zone legacy rows found; live data only for the symbol the user names (no default gold); 'sl'/'tp' word-boundary price gate; snapshot/Claude/DeepSeek prep bounded by timeouts; Lily always replies")] + BUILD_LOG
+
+
 if __name__ == "__main__":
     main()
