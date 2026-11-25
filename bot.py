@@ -18432,6 +18432,14 @@ def _lyli_chart_command(chat_id, text_, user_id=None):
         if ci_path:
             _lyli_telegram_upload(chat_id,"sendPhoto","photo",ci_path,
                 f"📊 TradingView reference · {html.escape(CHARTIMG_SYMBOL)} · {tf}\nNot the broker's execution feed; compare symbol/exchange before using levels.",tid)
+            tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
+               text=f"<b>TradingView status:</b> <code>OK</code> · {html.escape(CHARTIMG_SYMBOL)} · {tf}")
+        else:
+            # Make provider/configuration failures visible instead of silently skipping the TV image.
+            tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
+               text="⚠️ <b>TradingView snapshot unavailable</b>\n"
+                    f"Reason: <code>{html.escape(str(ci_status)[:500])}</code>\n"
+                    "Python Chart ត្រូវបានផ្ញើរួចហើយ។ សូមពិនិត្យ CHARTIMG_API_KEY / CHARTIMG_ENABLED និង API quota នៅ Railway។")
         alpha=_lyli_alpha_gold_crosscheck(row["price"]) if symbol=="XAUUSD" else {"status":"not_applicable"}
         if alpha.get("price") is not None:
             tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
@@ -18453,27 +18461,59 @@ def _lyli_chart_command(chat_id, text_, user_id=None):
 
 
 def _lyli_chartimg_snapshot(timeframe, drawings=None):
-    """Optional TradingView reference image. The Python chart remains the numeric overlay authority."""
-    if not (CHARTIMG_ENABLED and CHARTIMG_API_KEY):
-        return None, "CHARTIMG_NOT_CONFIGURED"
-    interval={"M1":"1m","M5":"5m","M15":"15m","M30":"30m","H1":"1h","H4":"4h"}.get(timeframe,"15m")
+    """Fetch a TradingView reference image from Chart-IMG. Python chart remains authoritative."""
+    if not CHARTIMG_ENABLED:
+        return None, "CHARTIMG_DISABLED (set CHARTIMG_ENABLED=1)"
+    if not CHARTIMG_API_KEY:
+        return None, "CHARTIMG_API_KEY_MISSING (add it in Railway Variables)"
+    interval={"M1":"1m","M5":"5m","M15":"15m","M30":"30m","H1":"1h","H4":"4h"}.get(str(timeframe).upper(),"15m")
     body={"symbol":CHARTIMG_SYMBOL,"interval":interval,"width":1400,"height":900,
           "theme":"dark","style":"candle","timezone":"Asia/Phnom_Penh","format":"png"}
-    if drawings: body["drawings"]=drawings[:5]
-    req=urllib.request.Request("https://api.chart-img.com/v2/tradingview/advanced-chart",
-        data=json.dumps(body).encode(),headers={"x-api-key":CHARTIMG_API_KEY,"Content-Type":"application/json"})
+    if drawings:
+        body["drawings"]=drawings[:5]
+    req=urllib.request.Request(
+        "https://api.chart-img.com/v2/tradingview/advanced-chart",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"x-api-key":CHARTIMG_API_KEY,"Content-Type":"application/json","Accept":"image/png,image/jpeg,image/webp,application/json"},
+        method="POST")
     try:
-        with urllib.request.urlopen(req,timeout=60) as resp:
-            data=resp.read(); ctype=resp.headers.get("Content-Type","")
-        if "image/" not in ctype or not data.startswith(b"\x89PNG"):
-            try: return None, json.loads(data.decode("utf-8")).get("message","ChartIMG returned non-image response")
-            except Exception: return None, "ChartIMG returned unexpected content type: "+ctype
-        out_dir=os.environ.get("LYLI_CHART_DIR") or _DB_DIR; os.makedirs(out_dir,exist_ok=True)
-        path=os.path.join(out_dir,f"lyli_chartimg_{timeframe}_{int(time.time())}.png")
-        with open(path,"wb") as f: f.write(data)
+        with urllib.request.urlopen(req,timeout=45) as resp:
+            data=resp.read()
+            ctype=(resp.headers.get("Content-Type") or "").lower()
+            http_status=getattr(resp,"status",200)
+        if not data:
+            return None, f"CHARTIMG_EMPTY_RESPONSE (HTTP {http_status}, {ctype or 'unknown content type'})"
+        # Validate actual image bytes rather than trusting the response header alone.
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            ext="png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            ext="jpg"
+        elif data.startswith(b"RIFF") and data[8:12]==b"WEBP":
+            ext="webp"
+        else:
+            detail=""
+            try:
+                payload=json.loads(data.decode("utf-8",errors="replace"))
+                detail=str(payload.get("message") or payload.get("error") or payload.get("detail") or payload)[:350]
+            except Exception:
+                detail=data[:220].decode("utf-8",errors="replace")
+            return None, f"CHARTIMG_NON_IMAGE_RESPONSE (HTTP {http_status}, {ctype or 'unknown'}): {detail}"
+        out_dir=os.environ.get("LYLI_CHART_DIR") or _DB_DIR
+        os.makedirs(out_dir,exist_ok=True)
+        path=os.path.join(out_dir,f"lyli_chartimg_{str(timeframe).lower()}_{int(time.time())}.{ext}")
+        with open(path,"wb") as f:
+            f.write(data)
         return path, "OK"
+    except urllib.error.HTTPError as exc:
+        try:
+            body_text=exc.read(1200).decode("utf-8",errors="replace")
+        except Exception:
+            body_text=""
+        return None, f"CHARTIMG_HTTP_{exc.code}: {body_text[:500] or str(exc)[:200]}"
+    except urllib.error.URLError as exc:
+        return None, f"CHARTIMG_NETWORK_ERROR: {str(getattr(exc,'reason',exc))[:250]}"
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {str(exc)[:180]}"
+        return None, f"CHARTIMG_ERROR_{type(exc).__name__}: {str(exc)[:250]}"
 
 
 def _lyli_alpha_gold_crosscheck(primary_price):
@@ -19133,7 +19173,7 @@ def _chat_system_prompt(chat_id):
         "'draw chart gold M5' / 'គូស chart មាស M15' / 'គូស zone'. The bot then posts a professional Python-drawn "
         "candlestick PNG with FVG/OB zones and key levels in the ANALYZE topic.\n"
         + ("A TradingView reference snapshot (Chart-IMG) is also sent.\n" if tv else
-           "The TradingView snapshot is NOT active (CHARTIMG_API_KEY missing); only the Python chart is sent.\n")
+           "TradingView snapshot is configured only when CHARTIMG_ENABLED=1 and CHARTIMG_API_KEY is present; runtime errors are reported separately.\n")
         + "Limits to state honestly: you cannot control the user's own TradingView account or draw on their screen; "
           "Entry/SL/TP come only from the bot's validated engine, never from the drawing. "
           "If the user asks for a chart, tell them the exact command to type.\n")
