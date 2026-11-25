@@ -19065,5 +19065,137 @@ BUILD_VERSION = "V25.3.3 LYLI · GEMINI + GROQ ONLY"
 BUILD_LOG = [("V25.3.3", "Claude/DeepSeek reviewers disabled by default (LYLI_EXTERNAL_REVIEWERS=1 re-enables); provider error messages are never posted; Lily answers with Gemini, falling back to Groq")] + BUILD_LOG
 
 
+
+# =============================================================================
+# V25.3.4 · LILY KNOWS HER CHART ABILITY + NATURAL-LANGUAGE CHART REQUESTS
+# Why Lily said "I can't draw TradingView":
+#  - the chart engine only fired on 7 exact phrases; any other wording went to the chat AI,
+#    which was never told that the bot can draw charts, so it answered "I can't".
+#  - the chart is posted in the ANALYZE topic, so a request made elsewhere looked ignored.
+#  - the TradingView image needs CHARTIMG_API_KEY and was skipped silently without it.
+# =============================================================================
+_LYLI_CHART_NOUNS = ("chart", "tradingview", "trading view", "candlestick", "ឆាត", "ក្រាហ្វ")
+_LYLI_CHART_VERBS = ("create", "show", "draw", "make", "generate", "send", "plot", "give me", "can you",
+                     "បង្កើត", "បង្ហាញ", "គូស", "គូរ", "ផ្ញើ", "ឲ្យ", "ឱ្យ", "ចង់", "សូម")
+_LYLI_ZONE_WORDS = ("zone", "ហ្សូន", "fvg", "order block", "ob ")
+
+
+def _lyli_is_chart_request(text_):
+    t = str(text_ or "").lower()
+    if not t or t.startswith("/"):
+        return False
+    if any(w in t for w in _LYLI_CHART_NOUNS) and any(w in t for w in _LYLI_CHART_VERBS):
+        return True
+    return ("គូស" in t or "គូរ" in t or "draw" in t) and any(w in t for w in _LYLI_ZONE_WORDS)
+
+
+_LYLI_V2534_PREV_HANDLE_UPDATE = handle_update
+
+
+def handle_update(update):
+    try:
+        m = update.get("message") or {}
+        txt = (m.get("text") or "").strip()
+        chat_id = (m.get("chat") or {}).get("id")
+        if txt and chat_id is not None and _lyli_is_chart_request(txt):
+            user_id = (m.get("from") or {}).get("id")
+            origin = _msg_thread(m)
+            _TG_CTX.v = {"chat_id": chat_id, "thread_id": origin}
+            if is_admin(user_id if user_id is not None else chat_id):
+                where = _topic_id_for(chat_id, "analyze")
+                note = "🌸 លីលីកំពុងគូស Chart…"
+                if where and where != origin:
+                    note += " នឹងផ្ញើលទ្ធផលក្នុង Topic <b>Analyze</b>។"
+                tg("sendMessage", chat_id=chat_id, text=note, parse_mode="HTML")
+                if re.search(r"trading\s?view", txt.lower()) and not (CHARTIMG_ENABLED and CHARTIMG_API_KEY):
+                    tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                       text="ℹ️ រូប <b>TradingView</b> ត្រូវការ <code>CHARTIMG_API_KEY</code> (chart-img.com) ក្នុង Railway។ "
+                            "ឥឡូវនេះខ្ញុំផ្ញើតែ Chart ដែលគូសដោយ Python (Zone/Level)។")
+            fake = copy.deepcopy(update)
+            fake["message"]["text"] = "/chart " + txt            # reuse the V25.3 /chart pipeline
+            return _LYLI_V2534_PREV_HANDLE_UPDATE(fake)
+    except Exception as exc:
+        traceback.print_exc()
+        print("V25.3.4 chart router:", type(exc).__name__, exc)
+    return _LYLI_V2534_PREV_HANDLE_UPDATE(update)
+
+
+_LYLI_V2534_PREV_PROMPT = _chat_system_prompt
+
+
+def _chat_system_prompt(chat_id):
+    base = _LYLI_V2534_PREV_PROMPT(chat_id)
+    tv = bool(CHARTIMG_ENABLED and CHARTIMG_API_KEY)
+    return base + (
+        "\n\n=== LILY CHART ABILITY (this bot CAN draw charts) ===\n"
+        "The bot has a built-in chart engine. NEVER say you cannot draw or create charts.\n"
+        "How: the user (Admin only) types /chart XAUUSD M15 or a natural request such as "
+        "'draw chart gold M5' / 'គូស chart មាស M15' / 'គូស zone'. The bot then posts a professional Python-drawn "
+        "candlestick PNG with FVG/OB zones and key levels in the ANALYZE topic.\n"
+        + ("A TradingView reference snapshot (Chart-IMG) is also sent.\n" if tv else
+           "The TradingView snapshot is NOT active (CHARTIMG_API_KEY missing); only the Python chart is sent.\n")
+        + "Limits to state honestly: you cannot control the user's own TradingView account or draw on their screen; "
+          "Entry/SL/TP come only from the bot's validated engine, never from the drawing. "
+          "If the user asks for a chart, tell them the exact command to type.\n")
+
+
+BUILD_VERSION = "V25.3.4 LYLI · CHART INTENT + CAPABILITY AWARENESS"
+BUILD_LOG = [("V25.3.4", "Natural-language chart requests (Khmer/English) routed to /chart pipeline; Lily is told she can draw charts; ack in the requesting topic; TradingView/Chart-IMG key hint")] + BUILD_LOG
+
+
+
+# =============================================================================
+# V25.3.5 · CHART REPLIES STAY IN THE TOPIC WHERE THE USER ASKED
+# V25.3 hard-coded every chart (and its status/error messages) to the ANALYZE topic.
+# Now, while a chart request is being served, "analyze" resolves to the requesting topic,
+# so the chart, caption, TradingView image and errors all appear where Lily was asked.
+# Scheduled Analyze alerts are NOT affected (override is thread-local and only active during a chart request).
+# =============================================================================
+_LYLI_REPLY_ORIGIN = threading.local()
+_LYLI_V2535_PREV_TOPIC_ID_FOR = _topic_id_for
+
+
+def _topic_id_for(chat_id, category):
+    o = getattr(_LYLI_REPLY_ORIGIN, "v", None)
+    if o is not None and str(o.get("chat_id")) == str(chat_id) and _topic_norm(category, "analyze") == "analyze":
+        return o.get("thread_id")
+    return _LYLI_V2535_PREV_TOPIC_ID_FOR(chat_id, category)
+
+
+_LYLI_V2535_CHART_WORDS = ("create chart", "show chart", "draw chart", "professional chart",
+                           "បង្កើតរូបភាព", "បង្ហាញ chart", "គូស zone")
+_LYLI_V2535_PREV_HANDLE_UPDATE = handle_update
+
+
+def handle_update(update):
+    m = (update or {}).get("message") or {}
+    txt = (m.get("text") or "").strip()
+    chat_id = (m.get("chat") or {}).get("id")
+    is_chart = False
+    if txt and chat_id is not None:
+        first = txt.split()[0].lower().split("@", 1)[0]
+        is_chart = (first == "/chart" or _lyli_is_chart_request(txt)
+                    or any(w in txt.lower() for w in _LYLI_V2535_CHART_WORDS))
+    if not is_chart:
+        return _LYLI_V2535_PREV_HANDLE_UPDATE(update)
+    _LYLI_REPLY_ORIGIN.v = {"chat_id": chat_id, "thread_id": _msg_thread(m)}
+    try:
+        return _LYLI_V2535_PREV_HANDLE_UPDATE(update)
+    finally:
+        _LYLI_REPLY_ORIGIN.v = None
+
+
+_LYLI_V2535_PREV_PROMPT = _chat_system_prompt
+
+
+def _chat_system_prompt(chat_id):
+    return _LYLI_V2535_PREV_PROMPT(chat_id).replace(
+        "in the ANALYZE topic", "in the SAME Topic where the user asked")
+
+
+BUILD_VERSION = "V25.3.5 LYLI · CHART REPLIES IN REQUESTING TOPIC"
+BUILD_LOG = [("V25.3.5", "Chart, caption, TradingView image and errors are posted in the Topic where the user asked (not forced to Analyze); scheduled Analyze alerts unchanged")] + BUILD_LOG
+
+
 if __name__ == "__main__":
     main()
