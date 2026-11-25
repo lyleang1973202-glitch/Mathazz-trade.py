@@ -19786,5 +19786,306 @@ BUILD_VERSION = "V25.4.2 LILY · LESS CANCEL/CUT + INSTANT PRICE DRIFT FIX"
 BUILD_LOG = [("V25.4.2", "Instant: CANCEL/CUT need held evidence (M1 alone never cuts; WAIT 15 min / HARD 5 min instead of 60 s / 30 s); Analyze: plan CANCEL after ~15 min (was 3 scans = 60 s), CUT needs a held break; Instant saved price now follows the market (was reused up to 15 min as 'live'); /pricecheck diagnostic")] + BUILD_LOG
 
 
+
+# =============================================================================
+# V25.5 · SMART MULTI-AI ROUTER (FREE-FIRST)
+# Additive final override: preserve existing trading engines, Telegram topics,
+# alerts, database and chart logic. AI calls are sequential, not fan-out.
+# Priority: Groq -> OpenRouter Free Router -> Gemini. DeepSeek/Claude are not
+# part of the default route because their APIs are paid / account-credit based.
+# =============================================================================
+OPENROUTER_API_KEY = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+OPENROUTER_MODEL = (os.environ.get("OPENROUTER_MODEL") or "openrouter/free").strip()
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+AI_ROUTER_ENABLED = (os.environ.get("AI_ROUTER_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
+AI_ROUTER_ORDER = [x.strip().lower() for x in
+                   (os.environ.get("AI_ROUTER_ORDER") or "groq,openrouter,gemini").split(",")
+                   if x.strip() in ("groq", "openrouter", "gemini")]
+if not AI_ROUTER_ORDER:
+    AI_ROUTER_ORDER = ["groq", "openrouter", "gemini"]
+AI_ROUTER_TIMEOUT = max(8, int(os.environ.get("AI_ROUTER_TIMEOUT") or 35))
+AI_ROUTER_CACHE_SECONDS = max(0, int(os.environ.get("AI_ROUTER_CACHE_SECONDS") or 45))
+AI_ROUTER_COOLDOWN_SECONDS = max(30, int(os.environ.get("AI_ROUTER_COOLDOWN_SECONDS") or 180))
+AI_OPENROUTER_DAILY_CAP = max(1, min(45, int(os.environ.get("AI_OPENROUTER_DAILY_CAP") or 45)))
+AI_OPENROUTER_PER_MINUTE_CAP = max(1, min(18, int(os.environ.get("AI_OPENROUTER_PER_MINUTE_CAP") or 18)))
+_AI_ROUTER_LOCK = threading.RLock()
+_AI_ROUTER_COOLDOWN = {}
+_AI_ROUTER_CACHE = {}
+_AI_ROUTER_USAGE = {"day": "", "openrouter_day": 0, "openrouter_minute": []}
+_AI_ROUTER_STATS = {"calls": {}, "success": {}, "errors": {}}
+
+
+def _ai_router_key(system_text, user_text, images, json_mode):
+    import hashlib as _hashlib
+    h = _hashlib.sha256()
+    h.update(str(system_text).encode("utf-8", "replace"))
+    h.update(b"\\0")
+    h.update(str(user_text).encode("utf-8", "replace"))
+    h.update(b"\\0json=" + str(bool(json_mode)).encode())
+    for label, raw in (images or []):
+        h.update(str(label).encode("utf-8", "replace"))
+        h.update(raw or b"")
+    return h.hexdigest()
+
+
+def _ai_router_available(provider):
+    if provider == "groq":
+        return bool(GROQ_API_KEY)
+    if provider == "openrouter":
+        return bool(OPENROUTER_API_KEY)
+    if provider == "gemini":
+        return bool(GEMINI_API_KEY) and not GEMINI_API_KEY.startswith("PASTE_")
+    return False
+
+
+def _ai_router_cooldown(provider, seconds=None, reason="temporary failure"):
+    until = time.time() + (seconds if seconds is not None else AI_ROUTER_COOLDOWN_SECONDS)
+    with _AI_ROUTER_LOCK:
+        _AI_ROUTER_COOLDOWN[provider] = until
+    print(f"AI ROUTER: {provider} cooldown {int(until-time.time())}s ({reason})")
+
+
+def _ai_router_openrouter_budget_ok():
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    with _AI_ROUTER_LOCK:
+        if _AI_ROUTER_USAGE["day"] != day:
+            _AI_ROUTER_USAGE.update(day=day, openrouter_day=0, openrouter_minute=[])
+        _AI_ROUTER_USAGE["openrouter_minute"] = [t for t in _AI_ROUTER_USAGE["openrouter_minute"] if now-t < 60]
+        if _AI_ROUTER_USAGE["openrouter_day"] >= AI_OPENROUTER_DAILY_CAP:
+            return False, "local daily safety cap reached"
+        if len(_AI_ROUTER_USAGE["openrouter_minute"]) >= AI_OPENROUTER_PER_MINUTE_CAP:
+            return False, "local per-minute safety cap reached"
+        _AI_ROUTER_USAGE["openrouter_day"] += 1
+        _AI_ROUTER_USAGE["openrouter_minute"].append(now)
+    return True, ""
+
+
+def _ai_openrouter_call(system_text, user_text, images=None, json_mode=False, timeout=None):
+    if not OPENROUTER_API_KEY:
+        return None, "OpenRouter key not set."
+    ok, why = _ai_router_openrouter_budget_ok()
+    if not ok:
+        return None, "OpenRouter skipped: " + why
+    content = [{"type": "text", "text": str(user_text)}]
+    for label, raw in (images or []):
+        if not raw:
+            continue
+        mime = "image/jpeg" if raw[:3] == b"\xff\xd8\xff" else "image/png"
+        content.insert(0, {"type": "text", "text": "[IMAGE: " + str(label) + "]"})
+        content.insert(1, {"type": "image_url", "image_url": {
+            "url": "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii")}})
+    body = {"model": OPENROUTER_MODEL,
+            "messages": [{"role": "system", "content": str(system_text)},
+                         {"role": "user", "content": content}],
+            "temperature": 0.2, "max_tokens": 5000}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request(
+        OPENROUTER_URL, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + OPENROUTER_API_KEY,
+                 "HTTP-Referer": "https://mathazz.ai",
+                 "X-Title": "MATHAZZ AI Trading Bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or AI_ROUTER_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") or {}) if choices else {}
+        answer = msg.get("content") or ""
+        if isinstance(answer, list):
+            answer = "".join(x.get("text", "") for x in answer if isinstance(x, dict))
+        answer = str(answer).strip()
+        return (answer, "") if answer else (None, "OpenRouter returned an empty answer.")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            detail = str(exc)
+        err = f"HTTP {exc.code}: {detail}"
+        if exc.code == 429:
+            _ai_router_cooldown("openrouter", 900, "rate/quota limit")
+        elif exc.code in (401, 402, 403):
+            _ai_router_cooldown("openrouter", 21600, "key, credit or permission error")
+        elif exc.code >= 500:
+            _ai_router_cooldown("openrouter", 120, "provider server error")
+        return None, err
+    except Exception as exc:
+        _ai_router_cooldown("openrouter", 90, type(exc).__name__)
+        return None, f"{type(exc).__name__}: {str(exc)[:250]}"
+
+
+def _ai_gemini_single(system_text, user_text, images=None, json_mode=False, timeout=None, max_out=5000):
+    """One Gemini model request only; avoid burning quota across multiple model retries."""
+    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("PASTE_"):
+        return None, "Gemini key not set."
+    model = GEMINI_MODEL
+    if QUOTA_BLOCK.get(model, 0) > time.time():
+        return None, "Gemini model is in quota cooldown."
+    parts = []
+    for label, raw in (images or []):
+        if raw:
+            mime = "image/jpeg" if raw[:3] == b"\xff\xd8\xff" else "image/png"
+            parts.extend([{"text": "[IMAGE: " + str(label) + "]"},
+                          {"inline_data": {"mime_type": mime,
+                                           "data": base64.b64encode(raw).decode("ascii")}}])
+    parts.append({"text": str(user_text)})
+    gc = {"temperature": 0.2, "maxOutputTokens": max(512, min(int(max_out), 8192))}
+    if json_mode:
+        gc["responseMimeType"] = "application/json"
+    payload = json.dumps({"system_instruction": {"parts": [{"text": str(system_text)}]},
+                          "contents": [{"role": "user", "parts": parts}],
+                          "generationConfig": gc}).encode("utf-8")
+    answer, err, _retryable = _gemini_once(model, payload, timeout or AI_ROUTER_TIMEOUT)
+    if answer:
+        return answer, ""
+    if "HTTP 429" in err:
+        low = err.lower()
+        daily = "per day" in low or "perday" in low.replace(" ", "")
+        wait = 86400 if daily else 300
+        QUOTA_BLOCK[model] = time.time() + wait
+        _ai_router_cooldown("gemini", wait, "Gemini quota/rate limit")
+    elif "HTTP 401" in err or "HTTP 403" in err:
+        _ai_router_cooldown("gemini", 21600, "Gemini authentication/permission error")
+    elif "HTTP 5" in err or "timeout" in err.lower():
+        _ai_router_cooldown("gemini", 120, "Gemini transient error")
+    return None, err
+
+
+def _ai_router_call_one(provider, system_text, user_text, images=None, json_mode=False,
+                        timeout=None, max_out=5000, think_budget=0):
+    if provider == "groq":
+        raw = images[0][1] if images else None
+        answer, err = groq_generate(system_text, user_text, raw, json_mode)
+        if not answer:
+            low = str(err).lower()
+            if "429" in low or "rate limit" in low or "quota" in low:
+                _ai_router_cooldown("groq", 300, "Groq rate/quota limit")
+            elif "401" in low or "403" in low:
+                _ai_router_cooldown("groq", 21600, "Groq key/permission error")
+            elif "500" in low or "503" in low or "timeout" in low:
+                _ai_router_cooldown("groq", 90, "Groq transient error")
+        return answer, err
+    if provider == "openrouter":
+        return _ai_openrouter_call(system_text, user_text, images, json_mode, timeout)
+    if provider == "gemini":
+        return _ai_gemini_single(system_text, user_text, images, json_mode, timeout, max_out)
+    return None, "Unknown AI provider."
+
+
+def _mathazz_ai_generate(system_text, user_text, image_bytes=None, images=None,
+                         json_mode=False, timeout=None, max_out=5000):
+    imgs = list(images or [])
+    if image_bytes:
+        imgs.insert(0, ("CHART IMAGE", image_bytes))
+    cache_key = _ai_router_key(system_text, user_text, imgs, json_mode)
+    now = time.time()
+    if AI_ROUTER_CACHE_SECONDS:
+        with _AI_ROUTER_LOCK:
+            hit = _AI_ROUTER_CACHE.get(cache_key)
+            if hit and now-hit[0] <= AI_ROUTER_CACHE_SECONDS:
+                print("AI ROUTER: cache hit")
+                return hit[1], ""
+            if hit:
+                _AI_ROUTER_CACHE.pop(cache_key, None)
+    order = list(AI_ROUTER_ORDER)
+    if not AI_ROUTER_ENABLED:
+        order = ["gemini", "groq", "openrouter"]
+    errors = []
+    for provider in order:
+        if not _ai_router_available(provider):
+            continue
+        if _AI_ROUTER_COOLDOWN.get(provider, 0) > time.time():
+            continue
+        with _AI_ROUTER_LOCK:
+            _AI_ROUTER_STATS["calls"][provider] = _AI_ROUTER_STATS["calls"].get(provider, 0) + 1
+        try:
+            answer, err = _ai_router_call_one(provider, system_text, user_text, imgs,
+                                               json_mode, timeout, max_out)
+        except Exception as exc:
+            answer, err = None, f"{type(exc).__name__}: {str(exc)[:200]}"
+        if answer:
+            with _AI_ROUTER_LOCK:
+                _AI_ROUTER_STATS["success"][provider] = _AI_ROUTER_STATS["success"].get(provider, 0) + 1
+                if AI_ROUTER_CACHE_SECONDS:
+                    _AI_ROUTER_CACHE[cache_key] = (time.time(), answer)
+                    if len(_AI_ROUTER_CACHE) > 300:
+                        oldest = sorted(_AI_ROUTER_CACHE.items(), key=lambda kv: kv[1][0])[:75]
+                        for k, _ in oldest:
+                            _AI_ROUTER_CACHE.pop(k, None)
+            print(f"AI ROUTER: success via {provider}")
+            return answer, ""
+        errors.append(f"[{provider}] {err or 'no response'}")
+        with _AI_ROUTER_LOCK:
+            _AI_ROUTER_STATS["errors"][provider] = _AI_ROUTER_STATS["errors"].get(provider, 0) + 1
+        print(f"AI ROUTER: {provider} failed: {str(err)[:220]}")
+    return None, "All configured AI providers failed or are cooling down. " + " | ".join(errors[:4])
+
+
+def gemini_generate(system_text, user_text, image_bytes=None, json_mode=False):
+    """Backward-compatible entry point; routes through free-first AI providers."""
+    return _mathazz_ai_generate(system_text, user_text, image_bytes=image_bytes,
+                                json_mode=json_mode, timeout=AI_ROUTER_TIMEOUT, max_out=7000)
+
+
+def gemini_generate_fast(system_text, user_text, image_bytes=None, json_mode=True,
+                         max_out=6144, timeout=None):
+    """Sequential free-first routing; no duplicate Gemini+Groq fan-out."""
+    return _mathazz_ai_generate(system_text, user_text, image_bytes=image_bytes,
+                                json_mode=json_mode, timeout=timeout or AI_ROUTER_TIMEOUT,
+                                max_out=max_out)
+
+
+def _ai_one(name, system_text, user_text, images, think_budget, max_out, timeout):
+    return _ai_router_call_one(name, system_text, user_text, images, True,
+                               timeout, max_out, think_budget)
+
+
+def _ai_parallel(system_text, user_text, images, providers, think_budget, max_out, timeout):
+    """Compatibility wrapper: sequential fallback, one accepted JSON result, never fake consensus."""
+    requested = set(providers or ())
+    # If a call requested Gemini/Groq, let the configured router use its free backups too.
+    order = [p for p in AI_ROUTER_ORDER if p in requested or requested.intersection({"gemini", "groq"})]
+    if not order:
+        order = [p for p in AI_ROUTER_ORDER if _ai_router_available(p)]
+    errs = []
+    for provider in order:
+        if not _ai_router_available(provider) or _AI_ROUTER_COOLDOWN.get(provider, 0) > time.time():
+            continue
+        try:
+            answer, err = _ai_router_call_one(provider, system_text, user_text, images,
+                                               True, timeout or AI_ROUTER_TIMEOUT, max_out, think_budget)
+        except Exception as exc:
+            answer, err = None, f"{type(exc).__name__}: {str(exc)[:180]}"
+        obj = _decode_ai_object(answer) if answer else None
+        if obj is not None:
+            print(f"AI ROUTER: structured result via {provider} (single-provider; fallback mode)")
+            return [(provider, obj)], errs
+        errs.append(f"[{provider}] {err or 'invalid JSON response'}")
+    return [], errs or ["No configured AI provider is available. Add GROQ_API_KEY, OPENROUTER_API_KEY or GEMINI_API_KEY."]
+
+
+def ai_router_status():
+    """Safe operational snapshot; never returns API keys."""
+    now = time.time()
+    with _AI_ROUTER_LOCK:
+        providers = {}
+        for name in ("groq", "openrouter", "gemini"):
+            providers[name] = {
+                "configured": _ai_router_available(name),
+                "cooldown_seconds": max(0, int(_AI_ROUTER_COOLDOWN.get(name, 0)-now)),
+                "calls": _AI_ROUTER_STATS["calls"].get(name, 0),
+                "success": _AI_ROUTER_STATS["success"].get(name, 0),
+                "errors": _AI_ROUTER_STATS["errors"].get(name, 0),
+            }
+        return {"enabled": AI_ROUTER_ENABLED, "order": list(AI_ROUTER_ORDER),
+                "providers": providers,
+                "openrouter_daily_used": _AI_ROUTER_USAGE.get("openrouter_day", 0),
+                "openrouter_daily_cap": AI_OPENROUTER_DAILY_CAP}
+
+
+BUILD_VERSION = "V25.5 SMART MULTI-AI ROUTER · FREE FIRST"
+BUILD_LOG = [("V25.5", "Additive free-first sequential AI routing: Groq -> OpenRouter Free -> Gemini; removes parallel duplicate requests from AI generation paths; adds cooldowns, short response cache, OpenRouter local safety caps and provider usage status; Python trading engines and Telegram routing preserved")] + BUILD_LOG
+
 if __name__ == "__main__":
     main()
