@@ -317,10 +317,12 @@ def _provider_order(symbol, timeframe=None):
     # Hard policy: all default callers (Analyze, Scan Zone, Dashboard, etc.) are Yahoo-only.
     allowed_tfs = getattr(_DATA_ACCESS, "timeframes", None)
     if (not _twelve_allowed() or (allowed_tfs is not None and timeframe not in allowed_tfs)
-            or not _twelve_has_key() or DATA_PROVIDER == "yahoo"):
+            or not _twelve_has_key() or (DATA_PROVIDER == "yahoo" and not getattr(_TWELVE_FEATURE_CTX, "force_primary", False))):
         return ["yahoo"]
     # Explicit Twelve opt-in only from Candle Pattern and selected Instant LTFs.
-    if _YF_STICKY.get(symbol, 0) > time.time() or _TWELVE_COOLDOWN["until"] > time.time():
+    if (_TWELVE_COOLDOWN["until"] > time.time()
+            or (_YF_STICKY.get(symbol, 0) > time.time()
+                and not getattr(_TWELVE_FEATURE_CTX, "force_primary", False))):
         return ["yahoo"]
     return ["twelve", "yahoo"]
 
@@ -509,7 +511,9 @@ def _rt_binance(symbol):
 
 
 def _rt_twelve(symbol):
-    if not _twelve_has_key() or DATA_PROVIDER == "yahoo" or _TWELVE_COOLDOWN["until"] > time.time():
+    if (not _twelve_has_key()
+            or (DATA_PROVIDER == "yahoo" and not getattr(_TWELVE_FEATURE_CTX, "force_primary", False))
+            or _TWELVE_COOLDOWN["until"] > time.time()):
         return None
     now = time.time()
     day = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -20601,6 +20605,261 @@ INSTANT_MONITOR_INTERVAL = 12
 SWING_ALERT_INTERVAL = 12
 BUILD_VERSION = "V27.1 DERIV PRIMARY · YAHOO BACKUP · 5 SCANS/MIN"
 BUILD_LOG = [("V27.1", "Deriv is the authoritative live quote for Analyze/Instant alerts; Yahoo is a labelled backup quote and historical-candle fallback; valid Deriv ticks are never discarded because Yahoo anchor is missing; deduplicated feed warnings; both alert workers remain at 12-second cadence; existing event-only alert lifecycle and button feature provider scopes preserved")] + BUILD_LOG
+
+
+# =============================================================================
+# V27.2 · STRICT DERIV SPOT VALIDATION + TWELVE PRIMARY FOR LILY / IMAGE
+# =============================================================================
+_TWELVE_FEATURE_CTX = threading.local()
+
+@contextlib.contextmanager
+def _twelve_primary_scope():
+    """Enable Twelve-first only inside Lily Assistant and Image Analysis call paths."""
+    prev = getattr(_TWELVE_FEATURE_CTX, "force_primary", False)
+    _TWELVE_FEATURE_CTX.force_primary = True
+    try:
+        yield
+    finally:
+        _TWELVE_FEATURE_CTX.force_primary = prev
+
+
+# Deriv must agree with the independent Yahoo backup reference before it can drive alerts.
+# If the reference is unavailable or the discrepancy is too large, use the Yahoo backup
+# with an explicit source label; never silently call a mismatched Deriv tick "spot".
+_V271_OLD_DERIV_ANCHOR_V272 = _deriv_alert_anchor
+_V272_LOG_STATE = {"t": {}, "lock": threading.Lock()}
+
+def _v272_log_once(key, message, interval=300):
+    now = time.time()
+    with _V272_LOG_STATE["lock"]:
+        last = _V272_LOG_STATE["t"].get(key, 0.0)
+        if now - last < interval:
+            return
+        _V272_LOG_STATE["t"][key] = now
+    print(message)
+
+
+def _v272_yahoo_reference(symbol):
+    try:
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            row = fetch_data(symbol, "M1", force=False, allow_twelve=False)
+        if not row or row[2] is None:
+            return None
+        price = _safe_num(row[0])
+        if price is None or price <= 0:
+            return None
+        return {"price": float(price), "t": time.time(), "source": "Yahoo_BACKUP",
+                "candle_time": getattr(row[2][-1], "ts", None)}
+    except Exception as exc:
+        _v272_log_once(("yahoo-ref-error", symbol),
+                       f"V27.2 Yahoo backup reference error {symbol}: {type(exc).__name__}")
+        return None
+
+
+def _deriv_alert_anchor(symbol):
+    tick = _deriv_quote(symbol)
+    ref = _v272_yahoo_reference(symbol)
+    # Gold futures vs spot may have a small basis. A large divergence is not acceptable.
+    # Thresholds are intentionally conservative; an unavailable reference means no trusted
+    # Deriv/Spot validation, so use backup if possible or skip the scan.
+    max_gap = {"XAUUSD": 0.008, "BTCUSD": 0.015, "ETHUSD": 0.015,
+               "EURUSD": 0.004, "GBPUSD": 0.004, "USDJPY": 0.004}.get(str(symbol).upper(), 0.005)
+
+    if tick and ref:
+        gap = abs(float(tick["price"]) - ref["price"]) / max(abs(ref["price"]), 1e-9)
+        if gap <= max_gap:
+            try:
+                shift, y_live, err = _instant_anchor_prepare(symbol, tick["price"], force=False)
+                if err:
+                    # Reference was already independently validated; use no synthetic shift.
+                    shift = 0.0
+                    y_live = ref["price"]
+                return dict(tick, y_live=y_live or ref["price"], shift=float(shift or 0.0),
+                            live_src="Deriv", validation_gap=gap)
+            except Exception as exc:
+                _v272_log_once(("deriv-anchor-error", symbol),
+                               f"V27.2 Deriv anchor warning {symbol}: {type(exc).__name__}")
+                return dict(tick, y_live=ref["price"], shift=0.0,
+                            live_src="Deriv", validation_gap=gap)
+
+        _v272_log_once(("deriv-mismatch", symbol),
+                       f"V27.2 REJECTED Deriv {symbol} tick: {gap*100:.2f}% away from Yahoo backup reference; "
+                       "using Yahoo backup only.")
+    elif tick and not ref:
+        _v272_log_once(("deriv-unverified", symbol),
+                       f"V27.2 Deriv {symbol} tick not cross-validated (Yahoo reference unavailable); "
+                       "not using unverified tick.")
+
+    if ref:
+        return {"t": ref["t"], "price": ref["price"], "src": "Yahoo_BACKUP",
+                "symbol": str(symbol).upper(), "epoch": None, "y_live": ref["price"],
+                "shift": 0.0, "live_src": "Yahoo_BACKUP", "validation_gap": None}
+
+    _v272_log_once(("no-trusted-price", symbol),
+                   f"V27.2 NO TRUSTED PRICE {symbol}: Deriv validation failed and Yahoo backup unavailable; scan skipped.")
+    return None
+
+
+# Ensure alert event lifecycle always consumes the validated quote chosen above.
+_V271_OLD_LIFECYCLE_V272 = _analyze_plan_lifecycle
+def _analyze_plan_lifecycle(chat_id, symbol, a):
+    if getattr(_DERIV_CTX, "enabled", False):
+        tick = _deriv_alert_anchor(symbol)
+        if not tick:
+            return
+        a = dict(a)
+        a["live"] = float(tick["price"])
+        a["live_source"] = tick.get("live_src", "Deriv")
+    return _V271_OLD_LIFECYCLE_V272(chat_id, symbol, a)
+
+
+# Re-assert Deriv validated quote as the Instant Alert anchor; do not accept an unvalidated tick.
+def _instant_tw_anchor(symbol):
+    tick = _deriv_alert_anchor(symbol)
+    if not tick:
+        return None, 0.0
+    return float(tick["price"]), float(tick.get("shift") or 0.0)
+
+
+# Twelve Data is the first-choice provider inside the explicitly permitted features,
+# regardless of DATA_PROVIDER=yahoo or a stale Yahoo sticky flag. API cooldown still applies.
+_V272_OLD_PROVIDER_ORDER = _provider_order
+def _provider_order(symbol, timeframe=None):
+    if (getattr(_TWELVE_FEATURE_CTX, "force_primary", False)
+            and _twelve_allowed() and _twelve_has_key()):
+        if _TWELVE_COOLDOWN["until"] > time.time():
+            return ["yahoo"]  # documented backup during provider cooldown
+        allowed_tfs = getattr(_DATA_ACCESS, "timeframes", None)
+        if allowed_tfs is None or timeframe in allowed_tfs:
+            return ["twelve", "yahoo"]
+    return _V272_OLD_PROVIDER_ORDER(symbol, timeframe)
+
+
+# Twelve Data /price is also the first-choice live quote for Lily. Yahoo candles are backup
+# only when Twelve is unavailable; delayed prices are explicitly labelled and not called live.
+_V272_OLD_LILY_SNAPSHOT = _lily_market_snapshot
+def _lily_market_snapshot(force=False):
+    now = time.time()
+    with _LILY_SNAPSHOT_LOCK:
+        hit = _LILY_SNAPSHOT_CACHE.get("value")
+        if not force and hit and now - _LILY_SNAPSHOT_CACHE.get("t", 0) < LILY_SNAPSHOT_CACHE_S:
+            return hit, ""
+
+    with _twelve_primary_scope(), _feature_data_access(allow_twelve=True, anchor=False):
+        tick = None
+        try:
+            p = _rt_twelve(LILY_SYMBOL)
+            if p and p > 0:
+                tick = {"price": float(p), "t": time.time(), "src": "Twelve Data /price"}
+        except Exception as exc:
+            _v272_log_once(("lily-twelve-quote", LILY_SYMBOL),
+                           f"V27.2 Lily Twelve quote failed: {type(exc).__name__}")
+        if tick:
+            try:
+                analysis = build_ict_analysis(LILY_SYMBOL, force=bool(force))
+            except Exception as exc:
+                _v272_log_once(("lily-twelve-ict", LILY_SYMBOL),
+                               f"V27.2 Lily Twelve candle analysis failed: {type(exc).__name__}")
+                analysis = None
+            if isinstance(analysis, dict) and not analysis.get("error") and analysis.get("status") != "DATA INSUFFICIENT":
+                snap = {"symbol": LILY_SYMBOL, "price": tick["price"], "source": "Twelve Data /price",
+                        "as_of": tick["t"], "age_s": 0.0, "analysis": analysis,
+                        "plan": analysis.get("plan"), "delayed": False}
+                with _LILY_SNAPSHOT_LOCK:
+                    _LILY_SNAPSHOT_CACHE.update(t=now, value=snap)
+                return snap, ""
+            return None, "TWELVE_CANDLE_ANALYSIS_UNAVAILABLE"
+
+        # Twelve is unavailable: use Yahoo only as a clearly labelled delayed backup.
+        try:
+            row = fetch_data(LILY_SYMBOL, "M1", force=False, allow_twelve=False)
+            if row and row[2]:
+                candle = row[2][-1]
+                price = float(row[0])
+                age = _chat_candle_close_age_min(candle, "M1")
+                snap = {"symbol": LILY_SYMBOL, "price": price, "source": "Yahoo BACKUP · delayed candle close",
+                        "as_of": time.time() - (float(age or 0) * 60), "age_s": float(age or 0) * 60,
+                        "analysis": {}, "plan": None, "delayed": True,
+                        "candle_time": candle.ts, "quote_error": "Twelve Data unavailable"}
+                return snap, ""
+        except Exception as exc:
+            _v272_log_once(("lily-yahoo-backup", LILY_SYMBOL),
+                           f"V27.2 Lily Yahoo backup failed: {type(exc).__name__}")
+        return None, "TWELVE_AND_YAHOO_UNAVAILABLE"
+
+
+# The shared chart-image ICT pipeline must use Twelve-first candles; chart price remains
+# the AI-read displayed price, not a Twelve live tick. Yahoo is only a backup if Twelve fails.
+def _anchored_ict(symbol, user_price):
+    out = {"ok": False, "err": "", "ict": None, "candles": {}, "shift": 0.0,
+           "delay": None, "synth": {}, "yahoo_live": None}
+    if symbol not in SYMBOLS_MAP or user_price is None:
+        out["err"] = "unknown symbol or price"
+        return out
+    dec = SYMBOLS_MAP[symbol]["decimals"]
+    synth, cmap = {}, {}
+    with _twelve_primary_scope(), _feature_data_access(allow_twelve=True, anchor=False):
+        try:
+            r1 = fetch_data(symbol, "M1", allow_twelve=True)
+            r15 = fetch_data(symbol, "M15", allow_twelve=True)
+        except Exception as exc:
+            out["err"] = f"market data error {type(exc).__name__}"
+            return out
+        if not r1 or r1[2] is None or not r15 or r15[2] is None:
+            out["err"] = "Twelve Data និង Yahoo Backup មិនមាន Candle Data"
+            return out
+        source1 = _SRC.get((symbol, "M1"), "unknown")
+        source15 = _SRC.get((symbol, "M15"), "unknown")
+        y_live = _safe_num(r1[0])
+        out["yahoo_live"] = y_live
+        if y_live and abs(float(user_price) - y_live) / max(abs(y_live), 1e-9) > CHAT_PRICE_MAX_DEV:
+            out["err"] = f"PRICE_MISMATCH:{y_live:.{dec}f}"
+            return out
+        gap0 = float(user_price) - y_live if y_live else 0.0
+        atr15 = calc_atr(r15[2])
+        shift = gap0 if (atr15 > 0 and abs(gap0) > 4 * atr15) else 0.0
+        out["shift"] = shift
+        out["delay"] = _chat_candle_close_age_min(r1[2][-1], "M1")
+        def fetcher(sym, tf, force=False):
+            res = fetch_data(sym, tf, force, allow_twelve=True)
+            if res is None or res[2] is None:
+                return res
+            # Keep all TFs on the same source if Twelve is healthy; provider order falls back to Yahoo.
+            synth[tf] = 0
+            cs = [Candle(c.open + shift, c.high + shift, c.low + shift, c.close + shift, c.ts, c.volume)
+                  for c in res[2]] if shift else res[2]
+            cmap[tf] = cs
+            return float(user_price), cs[-1].close, cs, len(cs)
+        try:
+            a = build_ict_analysis(symbol, force=False, _fetch=fetcher)
+        except Exception as exc:
+            out["err"] = f"analysis error {type(exc).__name__}"
+            return out
+        if not a or a.get("status") == "DATA INSUFFICIENT":
+            out["err"] = "Twelve/Yahoo candle data insufficient"
+            return out
+        a["price"] = float(user_price)
+        a["market_data_source"] = f"M1={source1}; M15={source15}; Twelve-first, Yahoo-backup"
+        out.update(ok=True, ict=a, candles=cmap, synth=synth)
+        return out
+
+
+# Image-analysis pipeline: force Twelve-first permission for the full nested call tree.
+_V272_OLD_RUN_AI_INNER = _run_ai_inner
+def _run_ai_inner(chat_id, msg_id, symbol, file_id=None, retry=None):
+    with _twelve_primary_scope(), _feature_data_access(allow_twelve=True, anchor=False):
+        return _V272_OLD_RUN_AI_INNER(chat_id, msg_id, symbol, file_id, retry)
+
+
+# Lily's normal chat snapshot is evaluated within the same Twelve-first scope.
+_V272_OLD_CHAT_ANSWER = chat_answer
+def chat_answer(chat_id, thread_id, user_id, question):
+    with _twelve_primary_scope(), _feature_data_access(allow_twelve=True, anchor=False):
+        return _V272_OLD_CHAT_ANSWER(chat_id, thread_id, user_id, question)
+
+
+BUILD_VERSION = "V27.2 DERIV SPOT VALIDATION · TWELVE PRIMARY LILY/IMAGE · YAHOO BACKUP"
+BUILD_LOG = [("V27.2", "Strict Deriv-vs-Yahoo backup validation; reject divergent Deriv ticks and label Yahoo backup; Twelve Data forced primary within Lily Assistant and Image Analysis regardless of DATA_PROVIDER=yahoo/sticky flags; Twelve /price primary for Lily with clearly-labelled delayed Yahoo backup; chart-image ICT candles Twelve-first; all other feature and alert provider scopes preserved")] + BUILD_LOG
 
 if __name__ == "__main__":
     main()
