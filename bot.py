@@ -17926,6 +17926,15 @@ DEEPSEEK_VISION_MODEL = (os.environ.get("DEEPSEEK_VISION_MODEL") or "deepseek-fl
 CHARTIMG_API_KEY = (os.environ.get("CHARTIMG_API_KEY") or "").strip()
 CHARTIMG_ENABLED = (os.environ.get("CHARTIMG_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
 CHARTIMG_SYMBOL = (os.environ.get("CHARTIMG_SYMBOL") or "OANDA:XAUUSD").strip()
+def _chartimg_dim(name, default):
+    try:
+        return max(200, int(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return default
+# Free Chart-IMG plan allows at most 800x600 (HTTP 403 "Exceed Max Usage Resolution Limit" otherwise).
+# Paid plans: set CHARTIMG_WIDTH / CHARTIMG_HEIGHT in Railway Variables (e.g. 1400 / 900).
+CHARTIMG_WIDTH = _chartimg_dim("CHARTIMG_WIDTH", 800)
+CHARTIMG_HEIGHT = _chartimg_dim("CHARTIMG_HEIGHT", 600)
 ALPHA_VANTAGE_API_KEY = (os.environ.get("ALPHA_VANTAGE_API_KEY") or "").strip()
 ALPHA_VANTAGE_ENABLED = (os.environ.get("ALPHA_VANTAGE_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
 _ALPHA_GOLD_CACHE = {"t": 0.0, "value": None}
@@ -18524,7 +18533,7 @@ def _lyli_chartimg_snapshot(timeframe, drawings=None):
     if not CHARTIMG_API_KEY:
         return None, "CHARTIMG_API_KEY_MISSING (add it in Railway Variables)"
     interval={"M1":"1m","M5":"5m","M15":"15m","M30":"30m","H1":"1h","H4":"4h"}.get(str(timeframe).upper(),"15m")
-    body={"symbol":CHARTIMG_SYMBOL,"interval":interval,"width":1400,"height":900,
+    body={"symbol":CHARTIMG_SYMBOL,"interval":interval,"width":CHARTIMG_WIDTH,"height":CHARTIMG_HEIGHT,
           "theme":"dark","style":"candle","timezone":"Etc/UTC","format":"png"}
     if drawings:
         body["drawings"]=drawings[:5]
