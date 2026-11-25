@@ -18136,7 +18136,7 @@ def _lyli_zone_payload(candles, live_price=None):
 
 
 def _lyli_render_chart(symbol, timeframe, candles, source="Unknown", live_price=None, plan=None):
-    """Render a real-data chart with calculated overlays. Matplotlib is optional but recommended."""
+    """Render a polished dark-purple LILY chart while preserving native overlays."""
     if not candles or len(candles) < 20:
         raise ValueError("Not enough candles to draw chart")
     cs = list(candles[-120:])
@@ -18149,39 +18149,64 @@ def _lyli_render_chart(symbol, timeframe, candles, source="Unknown", live_price=
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-        fig, ax = plt.subplots(figsize=(15, 8), dpi=130)
+        from matplotlib.patches import Rectangle, Patch
+        from matplotlib.lines import Line2D
+        fig, ax = plt.subplots(figsize=(15, 8.2), dpi=150)
+        fig.patch.set_facecolor("#090d1d")
+        ax.set_facecolor("#0d1428")
+        up_color, down_color = "#20d49a", "#ff526d"
         width = 0.62
         for i, c in enumerate(cs):
-            up = c.close >= c.open
-            ax.vlines(i, c.low, c.high, linewidth=0.9)
-            body_low = min(c.open, c.close)
-            body_h = max(abs(c.close - c.open), max((c.high-c.low)*0.004, 1e-8))
+            up = float(c.close) >= float(c.open)
+            color = up_color if up else down_color
+            ax.vlines(i, c.low, c.high, color=color, linewidth=1.05, alpha=0.95, zorder=3)
+            body_low = min(float(c.open), float(c.close))
+            body_h = max(abs(float(c.close)-float(c.open)), max((float(c.high)-float(c.low))*0.004, 1e-8))
             ax.add_patch(Rectangle((i-width/2, body_low), width, body_h,
-                                   fill=True, alpha=0.78, linewidth=0.6,
-                                   hatch=None if up else "\\\\"))
+                                   facecolor=color, edgecolor=color, linewidth=0.65,
+                                   alpha=0.92, zorder=4))
+        # Zone overlays: subtle fill plus readable labels, without obscuring candles.
         for z in payload["zones"]:
             x0 = max(0, min(len(cs)-1, z["index"] - (len(candles)-len(cs))))
-            color = "#2ca02c" if z["direction"] == "BUY" else "#d62728"
+            color = "#22d49a" if z["direction"] == "BUY" else "#ff5572"
             ax.axhspan(z["low"], z["high"], xmin=max(0, x0/len(cs)), xmax=1,
-                       alpha=0.11, color=color)
-            ax.text(max(0, x0), (z["low"]+z["high"])/2, z["name"], fontsize=7, color=color)
+                       alpha=0.105, color=color, zorder=1)
+            ax.text(max(0, x0)+0.5, (z["low"]+z["high"])/2, str(z["name"]),
+                    fontsize=6.5, color=color, alpha=0.9, va="center", zorder=5)
+        # Reference levels are dashed and intentionally differentiated from trade-plan levels.
         for lv in payload["levels"]:
-            ax.axhline(lv["price"], linestyle="--", linewidth=0.8, alpha=0.65)
-            ax.text(len(cs)-1, lv["price"], " " + lv["name"], fontsize=7, va="bottom")
+            ax.axhline(float(lv["price"]), linestyle=(0,(3,4)), linewidth=0.8,
+                       color="#9aa8c7", alpha=0.55, zorder=2)
         if isinstance(plan, dict):
-            for key, label, style in (("entry","ENTRY","-"),("sl","STOP LOSS","--"),("tp1","TP1","--"),("tp2","TP2","--"),("tp3","TP3","--")):
-                value=plan.get(key)
-                if isinstance(value,(int,float)) and math.isfinite(float(value)):
-                    ax.axhline(float(value), linestyle=style, linewidth=1.2, alpha=0.9)
-                    ax.text(len(cs)-1, float(value), " "+label, fontsize=8, va="bottom")
-        ax.set_title(f"{symbol} · {timeframe} · MATHAZZ AI V25.3 | Source: {source}\n"
-                     f"Last candle: {getattr(cs[-1], 'ts', 'unknown')} | Pattern: {payload['pattern']}")
-        ax.set_ylabel("Price")
-        ax.grid(True, alpha=0.18)
-        ax.set_xlim(-1, len(cs)+5)
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight")
+            level_styles = (("entry","ENTRY","#48a9ff","-"),("sl","STOP LOSS","#ff526d","--"),
+                            ("tp1","TP1","#20d49a","--"),("tp2","TP2","#20d49a",":"),("tp3","TP3","#20d49a",":"))
+            for key, label, color, style in level_styles:
+                value = plan.get(key)
+                if isinstance(value, (int,float)) and math.isfinite(float(value)):
+                    ax.axhline(float(value), linestyle=style, color=color, linewidth=1.35,
+                               alpha=0.95, zorder=6)
+                    ax.text(len(cs)-1, float(value), f"  {label} {float(value):.2f}",
+                            fontsize=7.3, color=color, va="bottom", ha="left",
+                            bbox={"facecolor":"#0b1020","edgecolor":"none","alpha":0.78,"pad":1.5}, zorder=7)
+        ax.set_title(f"{symbol}  ·  {timeframe}  ·  LILY PROFESSIONAL\nSource: {source}   |   Last candle: {getattr(cs[-1], 'ts', 'unknown')}   |   Pattern: {payload['pattern']}",
+                     color="#f4eaff", fontsize=12, fontweight="bold", pad=15)
+        ax.set_ylabel("Price", color="#c6cce0", fontsize=9)
+        ax.tick_params(colors="#c6cce0", labelsize=8)
+        ax.grid(True, color="#526080", alpha=0.22, linewidth=0.65)
+        for spine in ax.spines.values():
+            spine.set_color("#7044bd")
+            spine.set_alpha(0.8)
+        ax.set_xlim(-1, len(cs)+8)
+        legend_items = [Patch(facecolor=up_color,label="Bullish candle"),
+                        Patch(facecolor=down_color,label="Bearish candle"),
+                        Patch(facecolor="#ff5572",alpha=.18,label="Supply / bearish zone"),
+                        Patch(facecolor="#22d49a",alpha=.18,label="Demand / bullish zone"),
+                        Line2D([0],[0],color="#48a9ff",lw=1.4,label="Entry / reference")]
+        leg=ax.legend(handles=legend_items,loc="upper left",ncol=3,fontsize=7.2,
+                      framealpha=.25,facecolor="#151b32",edgecolor="#7044bd")
+        for t in leg.get_texts(): t.set_color("#e7e2f4")
+        fig.tight_layout(pad=1.4)
+        fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
         return path, payload, "PNG"
     except ImportError:
@@ -18193,23 +18218,23 @@ def _lyli_render_chart(symbol, timeframe, candles, source="Unknown", live_price=
         def yy(v): return top + (ymax-v)/(ymax-ymin)*(h-top-bottom)
         step = (w-left-right)/len(cs)
         parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
-                 '<rect width="100%" height="100%" fill="#101827"/>',
-                 f'<text x="{left}" y="38" fill="white" font-size="24">{html.escape(symbol)} · {html.escape(timeframe)} · MATHAZZ AI V25.3</text>']
+                 '<rect width="100%" height="100%" fill="#090d1d"/>',
+                 f'<text x="{left}" y="38" fill="#f4eaff" font-size="24">{html.escape(symbol)} · {html.escape(timeframe)} · LILY PROFESSIONAL</text>']
         for i,c in enumerate(cs):
-            x=left+(i+0.5)*step; color="#2ecc71" if c.close>=c.open else "#ff5b65"
+            x=left+(i+0.5)*step; color="#20d49a" if c.close>=c.open else "#ff526d"
             parts.append(f'<line x1="{x}" y1="{yy(c.high)}" x2="{x}" y2="{yy(c.low)}" stroke="{color}"/>')
             y=min(yy(c.open),yy(c.close)); bh=max(2,abs(yy(c.open)-yy(c.close)))
             parts.append(f'<rect x="{x-step*.28}" y="{y}" width="{step*.56}" height="{bh}" fill="{color}"/>')
         for z in payload["zones"]:
-            y1,y2=yy(z["high"]),yy(z["low"]); col="#2ecc71" if z["direction"]=="BUY" else "#ff5b65"
+            y1,y2=yy(z["high"]),yy(z["low"]); col="#20d49a" if z["direction"]=="BUY" else "#ff526d"
             parts.append(f'<rect x="{left}" y="{y1}" width="{w-left-right}" height="{max(1,y2-y1)}" fill="{col}" opacity=".12"/>')
-            parts.append(f'<text x="{left+5}" y="{(y1+y2)/2}" fill="{col}" font-size="13">{html.escape(z["name"])}</text>')
+            parts.append(f'<text x="{left+5}" y="{(y1+y2)/2}" fill="{col}" font-size="13">{html.escape(str(z["name"]))}</text>')
         if isinstance(plan,dict):
-            for key,label,col in (("entry","ENTRY","#ffffff"),("sl","STOP LOSS","#ff5b65"),("tp1","TP1","#2ecc71"),("tp2","TP2","#2ecc71"),("tp3","TP3","#2ecc71")):
+            for key,label,col in (("entry","ENTRY","#48a9ff"),("sl","STOP LOSS","#ff526d"),("tp1","TP1","#20d49a"),("tp2","TP2","#20d49a"),("tp3","TP3","#20d49a")):
                 value=plan.get(key)
                 if isinstance(value,(int,float)) and math.isfinite(float(value)):
                     y=yy(float(value)); parts.append(f'<line x1="{left}" y1="{y}" x2="{w-right}" y2="{y}" stroke="{col}" stroke-dasharray="7,5"/>')
-                    parts.append(f'<text x="{w-right-100}" y="{y-5}" fill="{col}" font-size="14">{label} {float(value):.2f}</text>')
+                    parts.append(f'<text x="{w-right-120}" y="{y-5}" fill="{col}" font-size="14">{label} {float(value):.2f}</text>')
         parts.append('</svg>')
         path = os.path.join(out_dir, "lyli_" + cache_key + ".svg")
         with open(path, "w", encoding="utf-8") as f: f.write("".join(parts))
@@ -18373,6 +18398,47 @@ def _lyli_save_signal(symbol, timeframe, snapshot, overlays, reviews, score, gra
     return sid
 
 
+def _lyli_ui_price(value):
+    """Compact display formatting for Telegram chart cards."""
+    try:
+        number=float(value)
+        return f"{number:,.2f}" if math.isfinite(number) else "N/A"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _lyli_chart_caption(symbol, tf, row, overlays, analysis, plan, score, grade, sid):
+    """Telegram-friendly structured dashboard caption; keep safely below 1024 chars."""
+    direction=str(analysis.get("direction") or "WAIT").upper()
+    status=str(analysis.get("status") or "UNAVAILABLE").replace("_"," ").title()
+    direction_icon="🟢" if direction=="BUY" else ("🔴" if direction=="SELL" else "⚪")
+    freshness=str(row.get("freshness") or "UNKNOWN").upper()
+    fresh_icon="🟢" if freshness in ("FRESH","LIVE") else "🟡"
+    pattern=str((overlays or {}).get("pattern") or "UNKNOWN").replace("_"," ")
+    zones=len((overlays or {}).get("zones") or [])
+    candle_time=html.escape(str(row.get("candle_time") or "N/A"))
+    source=html.escape(str(row.get("source") or "Unknown"))
+    lines=[f"🌸 <b>LILY PROFESSIONAL  ·  {html.escape(symbol)} {html.escape(tf)}</b>",
+           f"💰 <b>{_lyli_ui_price(row.get('price'))}</b>   {direction_icon} <b>{html.escape(direction)}</b> · {html.escape(status)}",
+           f"📡 {fresh_icon} <b>{html.escape(freshness)}</b>  ·  {source}",
+           f"🕯 Candle: <code>{candle_time}</code>",
+           "━━━━━━━━━━━━━━━━━━",
+           f"📊 <b>MARKET OVERVIEW</b>  ·  Zones: <b>{zones}</b>  ·  Pattern: <b>{html.escape(pattern[:32])}</b>"]
+    if plan:
+        lines += ["🎯 <b>SETUP LEVELS</b>",
+                  f"🔹 Entry: <code>{_lyli_ui_price(plan.get('entry'))}</code>   🛑 SL: <code>{_lyli_ui_price(plan.get('sl'))}</code>",
+                  f"🟢 TP1: <code>{_lyli_ui_price(plan.get('tp1'))}</code>   TP2: <code>{_lyli_ui_price(plan.get('tp2'))}</code>   TP3: <code>{_lyli_ui_price(plan.get('tp3'))}</code>"]
+    else:
+        lines += ["🎯 <b>SETUP LEVELS</b>", "⚪ No validated Entry / SL / TP plan · WAIT"]
+    lines += ["━━━━━━━━━━━━━━━━━━",
+              f"🧠 <b>ENGINE</b>  ·  ICT: <b>{html.escape(direction)} / {html.escape(status)}</b>",
+              f"🏅 Validator evidence: <b>{int(score)}/100 · {html.escape(str(grade))}</b>",
+              f"🧾 Signal ID: <code>{sid}</code>  ·  <b>📋 PAPER REVIEW ONLY</b>",
+              "<i>Validator score is evidence quality, not win probability. Chart renderer does not create trade levels.</i>"]
+    caption="\n".join(lines)
+    return caption[:1015]
+
+
 def _lyli_chart_command(chat_id, text_, user_id=None):
     if not is_admin(user_id if user_id is not None else chat_id):
         tg("sendMessage",chat_id=chat_id,text="🔒 Chart Generation is Admin only.",parse_mode="HTML")
@@ -18406,16 +18472,7 @@ def _lyli_chart_command(chat_id, text_, user_id=None):
         reviews=_lyli_ai_vision_review(raw,f"Review this {symbol} {tf} chart. Distinguish actual visible structure from uncertain overlays.") if fmt_=="PNG" else {"claude":{"status":"needs_png"},"deepseek":{"status":"needs_png"}}
         score,grade,reasons=_lyli_validator_score(snap,overlays,reviews,analysis,intelligence)
         sid=_lyli_save_signal(symbol,tf,snap,overlays,reviews,score,grade,analysis)
-        caption=(f"🌸 <b>LYLI PROFESSIONAL CHART · {symbol} {tf}</b>\n"
-                 f"Price: <b>{row['price']}</b> · Source: {html.escape(row['source'])}\n"
-                 f"Candle time: {html.escape(row['candle_time'])}\n"
-                 f"Data status: <b>{html.escape(row['freshness'])}</b>\n"
-                 f"Zones detected: {len(overlays['zones'])} · Pattern: {html.escape(str(overlays['pattern']))}\n"
-                 f"ICT: {html.escape(str(analysis.get('direction','WAIT')))} · {html.escape(str(analysis.get('status','UNAVAILABLE')))}\n"
-                 + (f"Entry {plan.get('entry')} · SL {plan.get('sl')} · TP1 {plan.get('tp1')} · TP2 {plan.get('tp2')} · TP3 {plan.get('tp3')}\n" if plan else "No validated Entry/SL/TP plan · WAIT\n") +
-                 f"Validator evidence score: <b>{score}/100 · {grade}</b> (not win probability)\n"
-                 f"Signal ID: <code>{sid}</code> · PAPER REVIEW ONLY\n"
-                 "Entry/SL/TP មិនត្រូវបានបង្កើតដោយ Chart Renderer ទេ។ ប្រើ Engine Signal ដែលបាន Validate ប៉ុណ្ណោះ។")
+        caption=_lyli_chart_caption(symbol,tf,row,overlays,analysis,plan,score,grade,sid)
         upload_method="sendPhoto" if fmt_=="PNG" else "sendDocument"
         field="photo" if fmt_=="PNG" else "document"
         _lyli_telegram_upload(chat_id,upload_method,field,path,caption,tid)
