@@ -11579,10 +11579,15 @@ def _instant_approach_text(symbol, direction, entry, sl, tp1, live, at_entry):
 # CANCEL needs score >= INSTANT_CANCEL_SCORE AND the opposition held >= INSTANT_CANCEL_HOLD_S.
 # So M1 alone never cancels; M5 alone needs price progress too; M1 + M5 together need to hold ~90 s.
 INSTANT_CANCEL_SCORE = int(os.environ.get("INSTANT_CANCEL_SCORE") or 5)
-INSTANT_CANCEL_HOLD_S = float(os.environ.get("INSTANT_CANCEL_HOLD_S") or 90)
-INSTANT_CANCEL_CLEAR_S = float(os.environ.get("INSTANT_CANCEL_CLEAR_S") or 60)   # evidence gone this long = start over
+INSTANT_CANCEL_HOLD_S = float(os.environ.get("INSTANT_CANCEL_HOLD_S") or 240)      # V25.4.2: was 90 s
+INSTANT_CANCEL_CLEAR_S = float(os.environ.get("INSTANT_CANCEL_CLEAR_S") or 120)   # evidence gone this long = start over (V25.4.2: was 60 s)
 _MON_OPP = {}
 _MON_OPP_LOCK = threading.Lock()
+# V25.4.2: a pending setup is dropped for WAIT/HARD only after the condition has lasted this long (it used to be
+# 6 scans x 10 s = 60 s, HARD = 30 s) -> far fewer "CANCEL" messages.
+INSTANT_INVALID_WAIT_S = float(os.environ.get("INSTANT_INVALID_WAIT_S") or 900)    # 15 min of continuous WAIT
+INSTANT_INVALID_HARD_S = float(os.environ.get("INSTANT_INVALID_HARD_S") or 300)    # 5 min of continuous HARD block
+_MON_INVALID_SINCE = {}                                                           # (chat, skey) -> start of the streak
 
 
 def _instant_cancel_evidence(key, old, old_dir, live, m1_opp, m5_opp, now=None):
@@ -11801,7 +11806,17 @@ def _instant_monitor_process(chat_id, symbol, result, lane=None):
                 invalid = 0
             else:
                 invalid = old["invalid_count"] + (1 if kind in ("WAIT", "HARD") else 0)
-            if invalid >= 6 or kind == "HARD" and invalid >= 3:
+            # V25.4.2: time-based. Any scan that is not WAIT/HARD (e.g. WATCH again) resets the streak.
+            _ik = (int(chat_id), skey)
+            if kind in ("WAIT", "HARD"):
+                _since = _MON_INVALID_SINCE.setdefault(_ik, time.time())
+                _need = INSTANT_INVALID_HARD_S if kind == "HARD" else INSTANT_INVALID_WAIT_S
+                _bad = (time.time() - _since) >= _need
+            else:
+                _MON_INVALID_SINCE.pop(_ik, None)
+                _bad = False
+            if _bad:
+                _MON_INVALID_SINCE.pop(_ik, None)
                 _cancel_if_announced(con, old, old_dir, "Pending setup no longer meets the confirmation / market-health conditions")
                 return
             flag = _proximity(old_dir, e_, sl_, t1_, flag)
@@ -11854,19 +11869,16 @@ def _instant_monitor_process(chat_id, symbol, result, lane=None):
             opposite = "SELL" if direction == "BUY" else "BUY"
             evs = (str(snap.get("m1_event") or ""), str(snap.get("m5_event") or ""))
             opposite_bias = "BEARISH" if direction == "BUY" else "BULLISH"
-            structural_break = any(e.startswith(("MSS", "BOS", "CHOCH")) and e.endswith(opposite_bias) for e in evs)
-            confirmed_reverse = kind == opposite and structural_break
-            if confirmed_reverse:
-                reason = "Opposite Python signal plus M1/M5 structural break"
-                sent = _send(
-                          text=_instant_monitor_event_text(symbol, "CUT", direction, old, live, reason),
-                          parse_mode="HTML")
-                if sent and sent.get("ok"):
-                    _instant_learning_resolve(con, symbol, old.get("signature"), "INVALIDATED", live, reason)
-                    _save(con, "IDLE", signature=old["signature"])
-                return
-            if structural_break:
-                reason = "Opposing M1/M5 structure detected; prior setup needs risk review"
+            _brk2 = lambda e: e.startswith(("MSS", "BOS", "CHOCH")) and e.endswith(opposite_bias)
+            _m1_opp, _m5_opp = _brk2(evs[0]), _brk2(evs[1])
+            confirmed_reverse = kind == opposite and _m5_opp           # V25.4.2: a full opposite signal still needs an M5 break
+            # V25.4.2: one M1 candle (or one M5 wick) used to CUT the trade instantly. Now the opposition must be
+            # HELD (same evidence score as CANCEL): M1 alone never cuts · M5+M1 ~4 min · M5 alone ~8 min + price against entry.
+            _cut_ok, _cut_why = _instant_cancel_evidence((int(chat_id), skey, "CUT"), old, direction, live,
+                                                         _m1_opp or confirmed_reverse, _m5_opp)
+            if _cut_ok:
+                reason = (("Opposite Python signal plus held M5 structure break" if confirmed_reverse
+                           else "Opposing M1/M5 structure held; prior setup needs risk review") + f" ({_cut_why})")
                 sent = _send(
                           text=_instant_monitor_event_text(symbol, "CUT", direction, old, live, reason),
                           parse_mode="HTML")
@@ -11887,6 +11899,7 @@ def _instant_monitor_process(chat_id, symbol, result, lane=None):
             if _instant_setup_blocked(con, chat_id, skey, direction, snap.get("entry"), snap.get("sl")):
                 return
             _MON_SETUP_LAST[(int(chat_id), skey)] = {"t": time.time(), "level": float(snap["entry"]), "direction": direction}
+            _MON_INVALID_SINCE.pop((int(chat_id), skey), None)          # V25.4.2: fresh setup = fresh streak
             flag = _proximity(direction, snap.get("entry"), snap.get("sl"), snap.get("tp1"), 0)
             _save(con, "SETUP", direction, snap.get("entry"), snap.get("sl"), snap.get("tp1"),
                   snap.get("tp2"), signature, 0, 0, flag)
@@ -14751,6 +14764,11 @@ def _swing_session_report(a):
 ANALYZE_TIME_ALERTS = (os.environ.get("ANALYZE_TIME_ALERTS") or "off").lower() in ("1", "on", "true", "yes")  # session report / news countdown / sweep / displacement
 ANALYZE_NEAR_ATR = float(os.environ.get("ANALYZE_NEAR_ATR") or 1.0)       # "near Entry" distance in ref ATR
 ANALYZE_AT_ENTRY_ATR = float(os.environ.get("ANALYZE_AT_ENTRY_ATR") or 0.2)
+# V25.4.2: Analyze scans every ~20 s. 3 missed scans = 60 s used to CANCEL a plan and ONE M5/M15 break used to CUT it.
+ANALYZE_PLAN_MISS_S = float(os.environ.get("ANALYZE_PLAN_MISS_S") or 900)            # plan must be gone this long before CANCEL
+ANALYZE_PLAN_MOVE_ATR = float(os.environ.get("ANALYZE_PLAN_MOVE_ATR") or 1.5)        # zone refinement tolerance (was 0.75 ATR)
+ANALYZE_CUT_HOLD_M15_S = float(os.environ.get("ANALYZE_CUT_HOLD_M15_S") or 300)      # M15 break must hold this long
+ANALYZE_CUT_HOLD_M5_S = float(os.environ.get("ANALYZE_CUT_HOLD_M5_S") or 900)        # M5-only break: longer + price must be against entry
 
 
 def _analyze_plan_init(con):
@@ -14854,10 +14872,11 @@ def _analyze_plan_lifecycle(chat_id, symbol, a):
                     if not send("CANCEL", "Price crossed the invalidation level before entry"):
                         return
                 drop(); return
-            changed = (plan is None) or plan["dir"] != d or abs(plan["entry"] - st["entry"]) > atr * 0.75
+            changed = (plan is None) or plan["dir"] != d or abs(plan["entry"] - st["entry"]) > atr * ANALYZE_PLAN_MOVE_ATR
             if changed:
                 st["miss"] += 1
-                if st["miss"] >= 3:                       # 3 scans in a row: the zone is really gone / replaced
+                _miss_max = max(3, int(ANALYZE_PLAN_MISS_S // max(1, SWING_ALERT_INTERVAL)))   # V25.4.2: ~15 min, not 3 scans
+                if st["miss"] >= _miss_max:               # the zone is really gone / replaced
                     if announced:
                         if not send("CANCEL", "Zone no longer qualifies / plan replaced"):
                             return
@@ -14903,9 +14922,24 @@ def _analyze_plan_lifecycle(chat_id, symbol, a):
         opp = "BEARISH" if d == "BUY" else "BULLISH"
         fc = a.get("frame_context") or {}
         evs = [str((fc.get(tf) or {}).get("event", "")).upper() for tf in ("M5", "M15")]
-        if any(e.startswith(("MSS", "BOS", "CHOCH")) and e.endswith(opp) for e in evs):
-            if send("CUT", "Opposite M5/M15 structure break"):
-                drop()
+        _m5b = evs[0].startswith(("MSS", "BOS", "CHOCH")) and evs[0].endswith(opp)
+        _m15b = evs[1].startswith(("MSS", "BOS", "CHOCH")) and evs[1].endswith(opp)
+        if _m5b or _m15b:
+            # V25.4.2: the break must be HELD. `miss` (unused while LIVE) counts consecutive scans with the break.
+            st["miss"] = int(st["miss"] or 0) + 1
+            _held = st["miss"] * max(1, SWING_ALERT_INTERVAL)
+            _need = ANALYZE_CUT_HOLD_M15_S if _m15b else ANALYZE_CUT_HOLD_M5_S
+            _risk = abs(st["entry"] - st["sl"])
+            _against = -sign * (live - st["entry"])            # > 0 when price is on the losing side of entry
+            _progress = _m15b or (_risk > 0 and _against >= 0.5 * _risk)
+            if _held >= _need and _progress:
+                if send("CUT", "Opposite M5/M15 structure break held " + str(int(_held // 60)) + " min"):
+                    drop()
+                    return
+            save()
+        elif st["miss"]:
+            st["miss"] = 0
+            save()
 
 
 ANALYZE_ZONE_ALERTS = (os.environ.get("ANALYZE_ZONE_ALERTS") or "on").lower() in ("1", "on", "true", "yes")   # V19
@@ -19540,6 +19574,216 @@ def handle_update(update):
 
 BUILD_VERSION = "V25.4 LILY · BUTTON PANEL"
 BUILD_LOG = [("V25.4", "Lily inline button panel: main-menu entry, /lily panel, ON/OFF, Market, Micro, Intel, Chart, quick Target and PnL buttons, Refresh")] + BUILD_LOG
+
+
+# =============================================================================
+# V25.4.1 HOTFIX · IMAGE ALERT TOPIC ≠ ANALYZE ALERT TOPIC
+#
+# ROOT CAUSE
+#  V25.3 collapsed the topic list to four destinations and mapped
+#  img / image / photo / chart / ai  ->  "analyze".  Result:
+#   1) `/topic set image` was saved as category "analyze" and OVERWROTE the real
+#      Analyze topic (PRIMARY KEY(chat_id, category)) -> Analyze alerts and image
+#      results ended up in the same Topic.
+#   2) run_ai_analysis() asks _topic_id_for(chat, "image") -> got the ANALYZE topic id,
+#      so every uploaded-chart result was pushed into the Analyze topic.
+#   3) The V25.3 "Claude + DeepSeek Independent Review" was hard-coded to
+#      _topic_send("analyze", ...), so the review landed in Analyze even when the
+#      photo was analysed in the Image topic.
+#  (V25.3.1 repaired this for "chat" only; "image" was left behind.)
+#
+# FIX
+#  - "image" is a real, independent category again (own row in alert_topic_registry).
+#  - Aliases img/image/photo/chart/ai now point to "image", not "analyze".
+#  - The Claude + DeepSeek review is sent to the "image" topic. If no Image topic is
+#    registered, it stays in the Topic where the user sent the photo (never General,
+#    never Analyze).
+#  - Scheduled Analyze alerts / Swing / paper reports keep using "analyze" untouched.
+# =============================================================================
+_TOPIC_CATEGORIES = {
+    "instant": "⚡ INSTANT",
+    "analyze": "🧭 ANALYZE",
+    "image": "📷 IMAGE",
+    "ictpro": "👑 ICT PRO",
+    "ict": "📘 ICT",
+    "chat": "💬 LILY CHAT",
+}
+_TOPIC_ALIASES = {
+    "inst": "instant", "ana": "analyze", "analyze": "analyze",
+    "img": "image", "image": "image", "photo": "image", "chart": "image", "ai": "image",
+    "ask": "chat", "talk": "chat", "chat": "chat", "lily": "chat",
+    "pro": "ictpro", "ictpro": "ictpro",
+    "scan": "ict", "zone": "ict", "scanzone": "ict", "ict": "ict",
+}
+
+
+def _run_ai_inner(chat_id, msg_id, symbol, file_id=None, retry=None):
+    """V25.4.1: same as V25.3 hybrid review, but the review goes to the IMAGE topic (not Analyze)."""
+    if LYLI_VISION_ENABLED and file_id and (ANTHROPIC_API_KEY or DEEPSEEK_API_KEY):
+        try:
+            raw = download_photo(file_id)
+            if raw:
+                img = _shrink_image(raw)
+                rv = _lyli_ai_vision_review(
+                    img, f"Review uploaded {symbol} trading chart. Do not invent exact prices or signal levels.")
+                summary = _lyli_review_summary(rv)
+                if summary:
+                    # category "image": registered Image topic, else the topic where the photo was sent
+                    _topic_send("image", chat_id=chat_id,
+                                text="🧠 <b>V25.3 Claude + DeepSeek Independent Review</b>\n" +
+                                     html.escape(summary)[:3500], parse_mode="HTML")
+        except Exception as exc:
+            print("V25.4.1 hybrid image review error:", type(exc).__name__, exc)
+    return _LYLI_V253_OLD_RUN_AI_INNER(chat_id, msg_id, symbol, file_id, retry)
+
+
+BUILD_VERSION = "V25.4.1 LILY · IMAGE TOPIC SEPARATED FROM ANALYZE"
+BUILD_LOG = [("V25.4.1", "Hotfix: Analyze Alert and Image Analyze results use separate Topics. 'image' is its own /topic category again (was aliased to analyze and overwrote the Analyze topic); Claude+DeepSeek image review now goes to the Image topic")] + BUILD_LOG
+
+
+# =============================================================================
+# V25.4.2 · INSTANT LIVE-PRICE DRIFT FIX + /pricecheck
+#
+# ROOT CAUSE (Instant button / refresh / details)
+#  view_instant() re-used the price the user typed up to INSTANT_USER_PRICE_TTL (15 min) as if it were the LIVE price.
+#  Gold can move several dollars in that time, so Entry / SL / TP and the "live" line were far from the broker price.
+#
+# FIX
+#  The saved price is now moved with the market: live = saved_price + (Yahoo now - Yahoo at the time it was saved).
+#  When the Twelve real-price lane has a newer tick than the typed price, that tick is the baseline instead.
+#  The original typed-at time is kept, so the baseline still expires after INSTANT_USER_PRICE_TTL and the
+#  bot asks for a new price (no endless chain of estimated prices).
+#  Falls back to the old behaviour if anything fails.
+#
+# /pricecheck [SYMBOL]  (admin) shows where the Instant price comes from and how old each part is.
+# =============================================================================
+INSTANT_PRICE_ADJ_MIN_S = float(os.environ.get("INSTANT_PRICE_ADJ_MIN_S") or 15)     # younger than this: use the typed price as is
+INSTANT_PRICE_ADJ_MAX_FRAC = float(os.environ.get("INSTANT_PRICE_ADJ_MAX_FRAC") or 0.01)   # Yahoo jump > 1 % = source switch, do not adjust
+
+
+def _instant_drift_price(chat, symbol):
+    """(price, used_drift) for the saved user price moved by the market since it was saved; (None, False) = none saved."""
+    rec = INSTANT_USER_PRICE.get((chat, symbol))
+    if not rec:
+        return None, False
+    now = time.time()
+    if now - rec["t"] > INSTANT_USER_PRICE_TTL:
+        return None, False                                   # expired: the normal flow asks for a new price
+    base_p, base_y = rec["price"], rec.get("y_live")
+    tk = _TW_TICK.get(symbol)
+    if tk and tk.get("y_live") and now - tk["t"] <= 600 and tk["t"] > rec["t"] + 60:
+        base_p, base_y = tk["price"], tk["y_live"]           # a newer real-price tick beats an older typed price
+    if now - rec["t"] < INSTANT_PRICE_ADJ_MIN_S and base_p == rec["price"]:
+        return rec["price"], False
+    if not base_y:
+        return base_p, False
+    with _feature_data_access(allow_twelve=False):
+        r1 = fetch_data(symbol, "M1", False)
+    if not r1 or r1[0] is None:
+        return base_p, False
+    y_now = float(r1[0])
+    if abs(y_now - base_y) / max(abs(base_y), 1e-9) > INSTANT_PRICE_ADJ_MAX_FRAC:
+        return base_p, False
+    return base_p + (y_now - base_y), True
+
+
+_V2542_PREV_VIEW_INSTANT = view_instant
+
+
+def view_instant(symbol, s, force=False, user_price=None):
+    chat = _instant_chat_id()
+    used, t0 = False, None
+    if user_price is None:
+        try:
+            user_price, used = _instant_drift_price(chat, symbol)
+            t0 = (INSTANT_USER_PRICE.get((chat, symbol)) or {}).get("t")
+        except Exception as exc:
+            print("V25.4.2 instant drift price warning:", type(exc).__name__, exc)
+            user_price, used = None, False
+    out = _V2542_PREV_VIEW_INSTANT(symbol, s, force, user_price)
+    if used and t0:
+        rec = INSTANT_USER_PRICE.get((chat, symbol))
+        if rec:
+            rec["t"] = t0                    # keep the ORIGINAL typed-at time: the baseline still expires on schedule
+    return out
+
+
+def _pricecheck_text(symbol):
+    dec = SYMBOLS_MAP[symbol]["decimals"]
+    f = lambda v: "—" if v is None else f"{v:.{dec}f}"
+    now = time.time()
+    lines = [f"🔎 <b>PRICE CHECK · {html.escape(symbol)}</b>", "━━━━━━━━━━━━━━"]
+    try:
+        with _feature_data_access(allow_twelve=False):
+            r1 = fetch_data(symbol, "M1", True)
+        y = r1[0] if r1 else None
+        age = _candle_age_min(r1[2][-1]) if r1 and r1[2] else None
+        lines.append(f"Yahoo M1 live: <code>{f(y)}</code>" + (f" · candle {age:.1f} min old" if age is not None else ""))
+    except Exception as exc:
+        y = None
+        lines.append(f"Yahoo: error {html.escape(type(exc).__name__)}")
+    tk = _TW_TICK.get(symbol)
+    if tk:
+        lines.append(f"Real tick: <code>{f(tk['price'])}</code> · {html.escape(str(tk['src']))} · {int(now - tk['t'])}s ago"
+                     f" · Yahoo then <code>{f(tk.get('y_live'))}</code>")
+    else:
+        lines.append("Real tick: none yet (Twelve/Binance/AI not answered) → monitor uses pure Yahoo")
+    rec = _INSTANT_TW.get(symbol)
+    if rec:
+        lines.append(f"Monitor offset: <code>{rec['off']:+.{dec}f}</code> · lane tick {int(now - rec['t'])}s old")
+    try:
+        up, _sh = _instant_tw_anchor(symbol)
+        lines.append(f"Monitor live price: <code>{f(up)}</code>" + ("" if up is not None else " (pure Yahoo)"))
+        if up is not None and y is not None:
+            lines.append(f"Monitor − Yahoo: <code>{up - y:+.{dec}f}</code>")
+    except Exception as exc:
+        lines.append(f"Monitor anchor error: {html.escape(type(exc).__name__)}")
+    chat = _instant_chat_id()
+    u = INSTANT_USER_PRICE.get((chat, symbol))
+    if u:
+        try:
+            est, drift = _instant_drift_price(chat, symbol)
+        except Exception:
+            est, drift = None, False
+        lines.append(f"Typed price: <code>{f(u['price'])}</code> · {int(now - u['t'])}s ago"
+                     + (f" → now ≈ <code>{f(est)}</code>" if est is not None else " (expired)"))
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("<i>ប្រៀបធៀប Monitor live price ជាមួយ Broker/TradingView ហើយផ្ញើលទ្ធផលមកខ្ញុំ បើនៅតែខុស។</i>")
+    return "\n".join(lines)
+
+
+_V2542_PREV_HANDLE_UPDATE = handle_update
+
+
+def handle_update(update):
+    try:
+        m = (update or {}).get("message") or {}
+        txt = (m.get("text") or "").strip()
+        if txt:
+            parts = txt.split()
+            _cmd, _, _tgt = parts[0].lower().partition("@")
+            if _tgt and _BOT_INFO.get("username") and _tgt != str(_BOT_INFO["username"]).lower():
+                _cmd = ""
+            if _cmd == "/pricecheck":
+                chat_id = (m.get("chat") or {}).get("id")
+                user_id = (m.get("from") or {}).get("id")
+                _TG_CTX.v = {"chat_id": chat_id, "thread_id": _msg_thread(m)}
+                if not is_admin(user_id if user_id is not None else chat_id):
+                    show(chat_id, None, "🔒 <b>ADMIN ONLY</b>", None)
+                    return
+                sym = (parts[1].upper() if len(parts) > 1 else "XAUUSD")
+                if sym not in SYMBOLS_MAP:
+                    show(chat_id, None, "❌ Symbol: " + ", ".join(SYMBOLS_MAP), None)
+                    return
+                show(chat_id, None, _pricecheck_text(sym), None)
+                return
+    except Exception as exc:
+        print("V25.4.2 pricecheck router:", type(exc).__name__, exc)
+    return _V2542_PREV_HANDLE_UPDATE(update)
+
+
+BUILD_VERSION = "V25.4.2 LILY · LESS CANCEL/CUT + INSTANT PRICE DRIFT FIX"
+BUILD_LOG = [("V25.4.2", "Instant: CANCEL/CUT need held evidence (M1 alone never cuts; WAIT 15 min / HARD 5 min instead of 60 s / 30 s); Analyze: plan CANCEL after ~15 min (was 3 scans = 60 s), CUT needs a held break; Instant saved price now follows the market (was reused up to 15 min as 'live'); /pricecheck diagnostic")] + BUILD_LOG
 
 
 if __name__ == "__main__":
