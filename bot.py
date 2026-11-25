@@ -17926,6 +17926,9 @@ DEEPSEEK_VISION_MODEL = (os.environ.get("DEEPSEEK_VISION_MODEL") or "deepseek-fl
 CHARTIMG_API_KEY = (os.environ.get("CHARTIMG_API_KEY") or "").strip()
 CHARTIMG_ENABLED = (os.environ.get("CHARTIMG_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
 CHARTIMG_SYMBOL = (os.environ.get("CHARTIMG_SYMBOL") or "OANDA:XAUUSD").strip()
+# Technical diagnostics (TradingView status/errors, Alpha Vantage cross-check) are hidden in chat.
+# They are still printed to Railway logs. Set LYLI_SHOW_DIAG=1 to show them in Telegram again.
+LYLI_SHOW_DIAG = (os.environ.get("LYLI_SHOW_DIAG") or "0").strip().lower() in ("1","true","yes","on")
 def _chartimg_dim(name, default):
     try:
         return max(200, int(os.environ.get(name) or default))
@@ -18498,16 +18501,19 @@ def _lyli_chart_command(chat_id, text_, user_id=None):
         if ci_path:
             _lyli_telegram_upload(chat_id,"sendPhoto","photo",ci_path,
                 f"📊 TradingView reference · {html.escape(CHARTIMG_SYMBOL)} · {tf}\nNot the broker's execution feed; compare symbol/exchange before using levels.",tid)
-            tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
-               text=f"<b>TradingView status:</b> <code>OK</code> · {html.escape(CHARTIMG_SYMBOL)} · {tf}")
+            if LYLI_SHOW_DIAG:
+                tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
+                   text=f"<b>TradingView status:</b> <code>OK</code> · {html.escape(CHARTIMG_SYMBOL)} · {tf}")
         else:
+            print("TradingView snapshot unavailable:", str(ci_status)[:300])
             # Make provider/configuration failures visible instead of silently skipping the TV image.
-            tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
-               text="⚠️ <b>TradingView snapshot unavailable</b>\n"
-                    f"Reason: <code>{html.escape(str(ci_status)[:500])}</code>\n"
-                    "Python Chart ត្រូវបានផ្ញើរួចហើយ។ សូមពិនិត្យ CHARTIMG_API_KEY / CHARTIMG_ENABLED និង API quota នៅ Railway។")
+            if LYLI_SHOW_DIAG:
+                tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
+                   text="⚠️ <b>TradingView snapshot unavailable</b>\n"
+                        f"Reason: <code>{html.escape(str(ci_status)[:500])}</code>\n"
+                        "Python Chart ត្រូវបានផ្ញើរួចហើយ។ សូមពិនិត្យ CHARTIMG_API_KEY / CHARTIMG_ENABLED និង API quota នៅ Railway។")
         alpha=_lyli_alpha_gold_crosscheck(row["price"]) if symbol=="XAUUSD" else {"status":"not_applicable"}
-        if alpha.get("price") is not None:
+        if alpha.get("price") is not None and LYLI_SHOW_DIAG:
             tg("sendMessage",chat_id=chat_id,message_thread_id=tid,parse_mode="HTML",
                text=f"🔎 Alpha Vantage cross-check: {alpha['price']} · difference vs primary {alpha.get('difference')} ({alpha.get('difference_pct'):.4f}%). Cross-check only; not used to replace candle data.")
         review_text=_lyli_review_summary(reviews)
