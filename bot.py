@@ -4551,7 +4551,7 @@ def _ipa_fire_text(row, price, dec):
 
 
 def _instant_price_alert_worker():
-    print(f"INSTANT PRICE ALERT: one-shot, polling every {INSTANT_ALERT_POLL}s (Yahoo only, no Twelve)")
+    print(f"INSTANT PRICE ALERT: one-shot, Deriv live quote + Yahoo candle wick check, every {INSTANT_ALERT_POLL}s")
     while True:
         try:
             with _pro_db() as con:
@@ -4569,12 +4569,13 @@ def _instant_price_alert_worker():
                 try:
                     with _feature_data_access(allow_twelve=False):
                         res = fetch_data(symbol, "M1", True)
+                    tick = _deriv_quote(symbol)
                 except Exception as exc:
                     print("INSTANT price alert data error:", symbol, exc)
                     continue
-                if not res or res[0] is None:
+                if not res or not tick:
                     continue
-                live, closed = res[0], (res[2] or [])
+                live, closed = float(tick["price"]), (res[2] or [])
                 for r in items:
                     _id, chat, thread, _s, level, side, off, direction, sl, tp1, note, created = r
                     if now - created > INSTANT_ALERT_TTL_H * 3600:
@@ -7958,7 +7959,7 @@ def _run_ai_inner(chat_id, msg_id, symbol, file_id=None, retry=None):
             except Exception as exc:
                 print('Image anchor error:', type(exc).__name__, exc)
         try:
-            _, _, tf_candles, _ = fetch_data(gsym, ctf, allow_twelve=False)
+            _, _, tf_candles, _ = fetch_data(gsym, ctf, allow_twelve=True)
         except Exception:
             tf_candles = []
         if anchor and anchor['candles'].get(ctf):
@@ -11958,7 +11959,7 @@ def _instant_monitor_process(chat_id, symbol, result, lane=None):
                     _save(con, "TP1_DONE", direction, old["entry"], old["sl"], old["tp1"], old["tp2"],
                           old["signature"], 0, 1, old.get("best_entry_hit", 0))
                 return
-            if old["tp1_hit"] and (old.get("best_entry_hit") or 0) < 2:
+            if False and old["tp1_hit"] and (old.get("best_entry_hit") or 0) < 2:  # V27: BE is not an alert event
                 returned_to_entry = (live <= old["entry"]) if direction == "BUY" else (live >= old["entry"])
                 if returned_to_entry:
                     reason = "TP1 was reached; price has returned to the planned entry (break-even reference)"
@@ -12342,7 +12343,7 @@ def _lane_fetch_tick(symbol):
             tk = _accept(p, "Binance")
             if tk:
                 return tk
-    elif _twelve_has_key() and DATA_PROVIDER != "yahoo" and _TWELVE_COOLDOWN["until"] <= time.time() and _tw_ledger_can(1):
+    elif False and _twelve_has_key() and DATA_PROVIDER != "yahoo" and _TWELVE_COOLDOWN["until"] <= time.time():  # V26: Twelve disabled in background scan lanes
         try:
             p = _rt_twelve(symbol)
         except Exception:
@@ -14930,7 +14931,13 @@ def _analyze_entry_confirmed(a, direction):
 
 def _analyze_plan_lifecycle(chat_id, symbol, a):
     dec = a["dec"]
-    live, _src = get_live_price(symbol)
+    # Alert workers must evaluate every lifecycle event against the Deriv tick only.
+    if globals().get("_DERIV_CTX") is not None and getattr(_DERIV_CTX, "enabled", False):
+        _deriv_live = _deriv_quote(symbol)
+        live = float(_deriv_live["price"]) if _deriv_live else None
+        _src = "Deriv"
+    else:
+        live, _src = get_live_price(symbol)
     if live is None:
         live = a.get("live")
     atr = a.get("ref_atr") or 0
@@ -15023,7 +15030,7 @@ def _analyze_plan_lifecycle(chat_id, symbol, a):
             if send("TP1", "TP1 reached"):
                 st["tp1_hit"] = 1; save()
             return
-        if st["tp1_hit"] and st["flag"] < 3 and sign * (live - st["entry"]) <= 0:
+        if False and st["tp1_hit"] and st["flag"] < 3 and sign * (live - st["entry"]) <= 0:  # V27: BE excluded
             if send("BE", "After TP1, price returned to the planned entry / break-even level"):
                 st["flag"] = 3
                 save()
@@ -15301,6 +15308,7 @@ _SWING_HB = {"t": 0.0}
 def _analyze_swing_alert_worker():
     print(f"V10.2 Swing Assistant active · interval={SWING_ALERT_INTERVAL}s · news lead=15m")
     while True:
+        _cycle_started = time.time()
         try:
             with _pro_db() as con:
                 subs = con.execute(
@@ -15326,7 +15334,7 @@ def _analyze_swing_alert_worker():
         except Exception as exc:
             print("V10.1 Swing Assistant worker error:", type(exc).__name__, exc)
             traceback.print_exc()
-        time.sleep(SWING_ALERT_INTERVAL)
+        time.sleep(max(0.0, SWING_ALERT_INTERVAL - (time.time() - _cycle_started)))
 
 
 def start_analyze_swing_worker():
@@ -15475,7 +15483,7 @@ def build_analyze(symbol, force=False):
     # V14: Analyze is the ONLY feature that may use Twelve Data (it may still use every other source as backup).
     # Background workers / Instant helpers call this under lock=True and stay Yahoo-only to protect Twelve credits.
     _locked = getattr(_DATA_ACCESS, "lock", False)
-    with _feature_data_access(allow_twelve=not _locked, lock=_locked):
+    with _feature_data_access(allow_twelve=False, lock=True):  # V26: Analyze/scan is Twelve-free
         result = _V102_OLD_BUILD_ANALYZE(symbol, force)
     if not isinstance(result, dict) or result.get("error"):
         return result
@@ -19898,6 +19906,528 @@ def handle_update(update):
 
 BUILD_VERSION = "V25.4.2 LILY · LESS CANCEL/CUT + INSTANT PRICE DRIFT FIX"
 BUILD_LOG = [("V25.4.2", "Instant: CANCEL/CUT need held evidence (M1 alone never cuts; WAIT 15 min / HARD 5 min instead of 60 s / 30 s); Analyze: plan CANCEL after ~15 min (was 3 scans = 60 s), CUT needs a held break; Instant saved price now follows the market (was reused up to 15 min as 'live'); /pricecheck diagnostic")] + BUILD_LOG
+
+
+
+# =============================================================================
+# V26 · REQUESTED PROVIDER / MARKET-DATA ROUTING
+# - Lily Assistant: Gemini -> Groq -> OpenRouter.
+# - Twelve Data candles: Lily Assistant, Instant button, Image Analysis only.
+# - Instant monitor / scan-alert workers remain Yahoo/other non-Twelve feeds.
+# - Instant asks for SYMBOL only; it never asks the user to type a live price.
+# - Image Analysis reads the uploaded image; no manual price prompt.
+# =============================================================================
+
+# Provider fallback for Lily chat only. Other AI engines keep their existing routing.
+_LILY_AI_CTX = threading.local()
+_V26_OLD_GEMINI_GENERATE = gemini_generate
+
+def gemini_generate(system_text, user_text, image_bytes=None, json_mode=False):
+    if not getattr(_LILY_AI_CTX, "active", False):
+        return _V26_OLD_GEMINI_GENERATE(system_text, user_text, image_bytes, json_mode)
+    answer, err = _V26_OLD_GEMINI_GENERATE(system_text, user_text, image_bytes, json_mode)
+    if answer:
+        return answer, ""
+    if AI_OPENROUTER_API_KEY:
+        try:
+            answer, router_err = openrouter_generate(
+                system_text, user_text, image_bytes=image_bytes, json_mode=json_mode)
+            if answer:
+                print("Lily AI: answered by OpenRouter backup")
+                return answer, ""
+            err = (str(err or "") + " | OpenRouter: " + str(router_err or "no answer"))[:900]
+        except Exception as exc:
+            err = (str(err or "") + " | OpenRouter: " + type(exc).__name__)[:900]
+    return None, err or "Gemini, Groq and OpenRouter are unavailable."
+
+_V26_OLD_CHAT_ANSWER = chat_answer
+def chat_answer(chat_id, thread_id, user_id, question):
+    old = getattr(_LILY_AI_CTX, "active", False)
+    _LILY_AI_CTX.active = True
+    try:
+        return _V26_OLD_CHAT_ANSWER(chat_id, thread_id, user_id, question)
+    finally:
+        _LILY_AI_CTX.active = old
+
+
+# Twelve Data access in Instant is scoped to the interactive button call.
+# The monitor invokes _view_instant_impl directly with this flag unset, so
+# background scans/alerts cannot spend Twelve credits.
+def _fetch_frames_parallel(symbol, tfs, force=False):
+    _up = getattr(_INSTANT_CTX, "user_price", None)
+    _shift = getattr(_INSTANT_CTX, "user_shift", 0.0) or 0.0
+    allow_tw = bool(getattr(_INSTANT_CTX, "allow_twelve", False))
+
+    def job(tf):
+        _ERR.msg = ""
+        with _feature_data_access(allow_twelve=allow_tw, timeframes=tfs if allow_tw else None):
+            res = fetch_data(symbol, tf, force, allow_twelve=allow_tw)
+        if _up is not None and res and res[2] is not None:
+            try:
+                cs, _n = _chat_anchor(res[2], tf, _up, _shift)
+                res = (_up, cs[-1].close, cs, len(cs))
+            except Exception as exc:
+                print("Instant anchor error:", tf, type(exc).__name__, exc)
+        return res, getattr(_ERR, "msg", "")
+
+    out, errs = {}, []
+    ex = ThreadPoolExecutor(max_workers=max(1, len(tfs) + 1))
+    try:
+        futs = {tf: ex.submit(job, tf) for tf in tfs}
+        ex.submit(_news_fetch)
+        for tf, f in futs.items():
+            try:
+                res, err = f.result(timeout=45)
+            except Exception as exc:
+                res, err = (None, None, None, 0), f"{type(exc).__name__}: {exc}"
+            out[tf] = res
+            if res[2] is None and err:
+                errs.append(f"{tf}: {err}")
+    finally:
+        ex.shutdown(wait=False)
+    if errs:
+        _ERR.msg = " | ".join(errs)[:400]
+    return out
+
+
+_V26_OLD_VIEW_INSTANT_INNER = _view_instant_inner
+def _view_instant_inner(symbol, s, force=False):
+    key = _instant_ckey(symbol, s)
+    user_px = None  # Twelve Data supplies the market price; never use a stale manually typed price.
+    if not force:
+        with _INSTANT_LOCK:
+            hit = _INSTANT_CACHE.get(key)
+        if hit and time.time() - hit["t"] < INSTANT_CACHE_TTL:
+            return hit["compact"], instant_buttons(symbol, _instant_chat_id())
+    previous = getattr(_INSTANT_CTX, "allow_twelve", False)
+    _INSTANT_CTX.allow_twelve = True
+    _INSTANT_CTX.user_price = None
+    _INSTANT_CTX.user_shift = 0.0
+    _INSTANT_CTX.data = None
+    try:
+        with _feature_data_access(allow_twelve=True, timeframes=("M1", "M5", "M15", "H1", "H4")):
+            res = _view_instant_impl(symbol, s, force)
+    finally:
+        _INSTANT_CTX.allow_twelve = previous
+    if isinstance(res, tuple):
+        return res
+    ctx = getattr(_INSTANT_CTX, "data", None)
+    if ctx:
+        try:
+            macro = micro = None
+            try:
+                macro = macro_signal(symbol, s, ctx, res)
+            except Exception:
+                traceback.print_exc()
+            try:
+                micro = micro_scalp_signal(symbol, s, ctx)
+            except Exception:
+                traceback.print_exc()
+            if macro is not None or micro is not None:
+                res["compact"] = instant_dual_card(symbol, ctx, macro, micro)
+                res["details"] = instant_dual_details(symbol, ctx, macro, micro, res.get("details"))
+        except Exception:
+            traceback.print_exc()
+    now = time.time()
+    with _INSTANT_LOCK:
+        if len(_INSTANT_CACHE) > 200:
+            for k in [k for k, v in _INSTANT_CACHE.items() if now - v["t"] > INSTANT_DETAILS_KEEP]:
+                _INSTANT_CACHE.pop(k, None)
+        _INSTANT_CACHE[key] = {
+            "t": now, "compact": res["compact"], "details": res["details"],
+            "ai_context": res.get("ai_context"), "ai_explanation": None,
+            "up": None, "monitor": res.get("monitor")
+        }
+    return res["compact"], instant_buttons(symbol, _instant_chat_id())
+
+
+def view_instant(symbol, s, force=False, user_price=None):
+    """Instant uses provider market data; user_price is intentionally ignored."""
+    _INSTANT_CTX.user_price = None
+    _INSTANT_CTX.user_shift = 0.0
+    return _view_instant_inner(symbol, s, force)
+
+
+# Image Analysis is allowed to use Twelve Data for its supporting candle context.
+# The chart's printed price remains an AI-read image value, clearly identified as such.
+_V26_OLD_GROUND_SYMBOL = _ground_symbol
+def _ground_symbol(symbol):
+    with _feature_data_access(allow_twelve=True):
+        return _V26_OLD_GROUND_SYMBOL(symbol)
+
+# The one timeframe read inside the image workflow also opts in to Twelve Data.
+# (The caller's thread-local permission is set by the wrapper below.)
+_V26_OLD_RUN_AI_INNER = _run_ai_inner
+def _run_ai_inner(chat_id, msg_id, symbol, file_id=None, retry=None):
+    previous = (getattr(_DATA_ACCESS, "allow_twelve", False),
+                getattr(_DATA_ACCESS, "timeframes", None),
+                getattr(_DATA_ACCESS, "lock", False),
+                getattr(_DATA_ACCESS, "anchor", False))
+    try:
+        with _feature_data_access(allow_twelve=True):
+            return _V26_OLD_RUN_AI_INNER(chat_id, msg_id, symbol, file_id, retry)
+    finally:
+        (_DATA_ACCESS.allow_twelve, _DATA_ACCESS.timeframes,
+         _DATA_ACCESS.lock, _DATA_ACCESS.anchor) = previous
+
+
+# Instant button routing: select a symbol and analyse immediately. Refresh also
+# fetches again. Alert/scan worker paths are not changed by this UI router.
+_V26_OLD_HANDLE_CALLBACK = handle_callback
+def handle_callback(chat_id, msg_id, data, user_id=None):
+    d = str(data or "")
+    p = d.split("_")
+    if _admin_only_callback(d) and not is_admin(user_id if user_id is not None else chat_id):
+        return _V26_OLD_HANDLE_CALLBACK(chat_id, msg_id, data, user_id)
+    sym = None
+    if len(p) >= 3 and p[0] == "pick" and p[1] == "inst":
+        sym = p[2]
+    elif len(p) >= 3 and p[0] == "inst" and p[1] == "refresh":
+        sym = p[2]
+    elif len(p) == 2 and p[0] == "inst":
+        sym = p[1]
+    if sym in SYMBOLS_MAP:
+        try:
+            plain(chat_id, msg_id, f"⏳ Instant · {html.escape(sym)} · កំពុងទាញ Twelve Data និងវិភាគ…")
+            text_out, markup = view_instant(sym, get_settings(chat_id), force=True)
+            show(chat_id, msg_id, text_out, markup)
+        except Exception as exc:
+            traceback.print_exc()
+            show(chat_id, msg_id, f"⚠️ Instant error: {html.escape(type(exc).__name__)}",
+                 instant_buttons(sym, chat_id))
+        return
+    return _V26_OLD_HANDLE_CALLBACK(chat_id, msg_id, data, user_id)
+
+
+# Image upload may proceed without a preceding symbol-selection prompt.
+# The image reader detects the instrument from the screenshot; XAUUSD is only
+# the neutral initial context and is not treated as proof of the chart symbol.
+_V26_OLD_HANDLE_UPDATE = handle_update
+def handle_update(update):
+    try:
+        m = (update or {}).get("message") or {}
+        if m.get("photo"):
+            chat_id = (m.get("chat") or {}).get("id")
+            if chat_id is not None and chat_id not in AWAITING:
+                AWAITING[chat_id] = "XAUUSD"
+    except Exception:
+        pass
+    return _V26_OLD_HANDLE_UPDATE(update)
+
+
+BUILD_VERSION = "V26.0 LILY GEMINI-FIRST · TWELVE DATA FEATURE SCOPED · INSTANT NO MANUAL PRICE"
+BUILD_LOG = [("V26.0", "Lily Assistant provider order Gemini -> Groq -> OpenRouter; Twelve Data scoped to Lily Assistant, Instant interactive button and Image Analysis; Instant asks symbol only and never asks manual price; Image Analysis accepts uploaded chart directly and reads visible price from AI; background Instant/scan monitor keeps Twelve disabled")] + BUILD_LOG
+
+
+
+# V26.0 policy hardening: Twelve is not used by Analyze or any background
+# quote/alert lane. Lily Assistant gets its own explicit Twelve /price call.
+_V26_OLD_LILY_MARKET_SNAPSHOT = _lily_market_snapshot
+def _lily_market_snapshot(force=False):
+    now = time.time()
+    try:
+        with _feature_data_access(allow_twelve=True):
+            tick, tick_source = rt_price(LILY_SYMBOL)
+            if tick and tick > 0 and tick_source == "Twelve":
+                analysis = build_ict_analysis(LILY_SYMBOL, force=bool(force))
+                if isinstance(analysis, dict) and not analysis.get("error") and analysis.get("status") != "DATA INSUFFICIENT":
+                    snap = {
+                        "symbol": LILY_SYMBOL, "price": float(tick),
+                        "source": "Twelve Data /price",
+                        "as_of": now, "age_s": 0.0,
+                        "analysis": analysis, "plan": analysis.get("plan"),
+                    }
+                    with _LILY_SNAPSHOT_LOCK:
+                        _LILY_SNAPSHOT_CACHE.update(t=now, value=snap)
+                    return snap, ""
+    except Exception as exc:
+        print("V26 Lily Twelve quote warning:", type(exc).__name__, exc)
+    return _V26_OLD_LILY_MARKET_SNAPSHOT(force)
+
+
+
+# =============================================================================
+# V27 · DERIV LIVE QUOTES FOR ALERT WORKERS ONLY
+# - Button features keep their V26 provider policy (Twelve only in Lily/Instant/Image).
+# - Analyze Alert + Instant Alert use Deriv live ticks; one shared quote cache per symbol.
+# - Each worker scans every 12s (5 scans/min). The Deriv request budget is capped at 55/min.
+# - Analyze/Instant alert channels are event-only: Confirmation / Near Entry / Entry /
+#   TP / SL / Cancel / Cut. BE and all periodic/noise events are suppressed.
+# =============================================================================
+import collections as _v27_collections
+
+DERIV_APP_ID = (os.environ.get("DERIV_APP_ID") or "1089").strip()
+DERIV_WS_URL = (os.environ.get("DERIV_WS_URL") or "wss://ws.derivws.com/websockets/v3").strip()
+DERIV_SCAN_INTERVAL = 12.0
+DERIV_QUOTE_TTL = 10.5
+DERIV_REQUESTS_PER_MINUTE = 55  # keep a safety margin below the stated 60/min limit
+DERIV_SYMBOL_MAP = {
+    "XAUUSD": "frxXAUUSD",
+    "EURUSD": "frxEURUSD",
+    "GBPUSD": "frxGBPUSD",
+    "USDJPY": "frxUSDJPY",
+    "BTCUSD": "cryBTCUSD",
+    "ETHUSD": "cryETHUSD",
+}
+try:
+    _DERIV_CUSTOM_MAP = json.loads(os.environ.get("DERIV_SYMBOL_MAP") or "{}")
+    if isinstance(_DERIV_CUSTOM_MAP, dict):
+        DERIV_SYMBOL_MAP.update({str(k).upper(): str(v) for k, v in _DERIV_CUSTOM_MAP.items() if v})
+except Exception:
+    print("V27: invalid DERIV_SYMBOL_MAP; using built-in Deriv symbol map")
+
+_DERIV_CACHE = {}
+_DERIV_LOCKS = {}
+_DERIV_GLOBAL_LOCK = threading.Lock()
+_DERIV_REQUEST_TIMES = _v27_collections.deque()
+_DERIV_CTX = threading.local()
+_V27_OLD_LANE_FETCH_TICK = _lane_fetch_tick
+_V27_OLD_V21_REFRESH = _v21_refresh_real_price_anchor
+
+
+def _deriv_symbol(symbol):
+    return DERIV_SYMBOL_MAP.get(str(symbol).upper())
+
+
+def _deriv_quote(symbol, force=False):
+    """Fetch one Deriv tick. Cached across both alert workers to share the API budget."""
+    sym = str(symbol).upper()
+    deriv_sym = _deriv_symbol(sym)
+    if not deriv_sym or not DERIV_APP_ID:
+        return None
+    lock = _DERIV_LOCKS.setdefault(sym, threading.Lock())
+    with lock:
+        now = time.time()
+        hit = _DERIV_CACHE.get(sym)
+        if hit and not force and now - hit["t"] <= DERIV_QUOTE_TTL:
+            return dict(hit)
+        with _DERIV_GLOBAL_LOCK:
+            while _DERIV_REQUEST_TIMES and now - _DERIV_REQUEST_TIMES[0] >= 60:
+                _DERIV_REQUEST_TIMES.popleft()
+            if len(_DERIV_REQUEST_TIMES) >= DERIV_REQUESTS_PER_MINUTE:
+                print("V27 Deriv rate guard: 55 requests/min reached; using last cached tick only")
+                return dict(hit) if hit and now - hit["t"] <= 30 else None
+            _DERIV_REQUEST_TIMES.append(now)
+        ws = None
+        try:
+            import websocket as _websocket
+            url = DERIV_WS_URL + ("&" if "?" in DERIV_WS_URL else "?") + urllib.parse.urlencode({"app_id": DERIV_APP_ID})
+            ws = _websocket.create_connection(url, timeout=8, enable_multithread=True)
+            ws.send(json.dumps({"ticks": deriv_sym, "subscribe": 1, "req_id": 27}))
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                raw = ws.recv()
+                if not raw:
+                    continue
+                payload = json.loads(raw)
+                if payload.get("error"):
+                    raise RuntimeError(str(payload["error"].get("message") or "Deriv API error"))
+                tick = payload.get("tick") or {}
+                quote = _safe_num(tick.get("quote"))
+                if quote is not None and quote > 0:
+                    record = {"t": time.time(), "price": float(quote), "src": "Deriv",
+                              "symbol": deriv_sym, "epoch": tick.get("epoch")}
+                    _DERIV_CACHE[sym] = record
+                    return dict(record)
+            raise TimeoutError("Deriv tick response timeout")
+        except Exception as exc:
+            print("V27 Deriv quote error:", sym, type(exc).__name__, str(exc)[:140])
+            return dict(hit) if hit and time.time() - hit["t"] <= 30 else None
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+
+
+def _deriv_alert_anchor(symbol):
+    """Deriv quote plus Yahoo reference basis; never called by ordinary button features."""
+    tick = _deriv_quote(symbol)
+    if not tick:
+        return None
+    try:
+        shift, y_live, err = _instant_anchor_prepare(symbol, tick["price"], force=False)
+        if err:
+            # Do not reject a valid Deriv quote solely because Yahoo's candle feed is delayed.
+            print("V27 Deriv/Yahoo anchor note:", symbol, err[:120])
+            y_live = None
+            shift = 0.0
+        out = dict(tick, y_live=y_live, shift=shift)
+        return out
+    except Exception as exc:
+        print("V27 Deriv anchor error:", symbol, type(exc).__name__, exc)
+        return dict(tick, y_live=None, shift=0.0)
+
+
+def _lane_fetch_tick(symbol):
+    # The original lane is retained for non-alert workflows. Alert workers opt in
+    # explicitly, so Deriv can never leak into normal Analyze/Lily/button features.
+    if getattr(_DERIV_CTX, "enabled", False):
+        tick = _deriv_alert_anchor(symbol)
+        if not tick or tick.get("y_live") is None:
+            return None
+        return {"t": tick["t"], "price": tick["price"], "src": "Deriv",
+                "y_live": tick["y_live"], "shift": tick.get("shift", 0.0)}
+    return _V27_OLD_LANE_FETCH_TICK(symbol)
+
+
+def _instant_tw_anchor(symbol):
+    """Instant Alert only: Deriv live tick bridged to Yahoo candles. Not used by button UI."""
+    tick = _deriv_alert_anchor(symbol)
+    if not tick:
+        return None, 0.0
+    return float(tick["price"]), float(tick.get("shift") or 0.0)
+
+
+_V27_OLD_INSTANT_TW_ANCHOR = globals().get("_instant_tw_anchor")
+
+
+def _analyze_lane_prepare(symbol):
+    if not getattr(_DERIV_CTX, "enabled", False):
+        return _V27_OLD_ANALYZE_LANE_PREPARE(symbol)
+    try:
+        tick = _deriv_alert_anchor(symbol)
+        if not tick or tick.get("y_live") is None:
+            return
+        prev = _ANCHOR.get(symbol)
+        off_now = float(tick["price"]) - float(tick["y_live"])
+        basis = (0.6 * float(prev["off"]) + 0.4 * off_now) if prev and time.time() - float(prev.get("t", 0)) < 1800 else off_now
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            r5 = fetch_data(symbol, "M5", False)
+        atr5 = calc_atr(r5[2]) if r5 and r5[2] else 0.0
+        applied = basis if (atr5 and abs(basis) >= 0.15 * atr5) else 0.0
+        _ANCHOR[symbol] = {"t": tick["t"], "off": basis, "applied": applied,
+                           "price": tick["price"], "src": "Deriv"}
+    except Exception as exc:
+        print("V27 Analyze Deriv anchor error:", symbol, type(exc).__name__, exc)
+
+
+_V27_OLD_ANALYZE_LANE_PREPARE = globals().get("_analyze_lane_prepare")
+
+
+def _v21_refresh_real_price_anchor(symbol):
+    if not getattr(_DERIV_CTX, "enabled", False):
+        return _V27_OLD_V21_REFRESH(symbol)
+    tick = _deriv_alert_anchor(symbol)
+    if not tick or tick.get("y_live") is None:
+        return None
+    try:
+        prev = _ANCHOR.get(symbol)
+        off_now = float(tick["price"]) - float(tick["y_live"])
+        basis = (0.6 * float(prev["off"]) + 0.4 * off_now) if prev and time.time() - float(prev.get("t", 0)) < 1800 else off_now
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            r5 = fetch_data(symbol, "M5", False)
+        atr5 = calc_atr(r5[2]) if r5 and r5[2] else 0.0
+        applied = basis if (atr5 and abs(basis) >= 0.15 * atr5) else 0.0
+        _ANCHOR[symbol] = {"t": tick["t"], "off": basis, "applied": applied,
+                           "price": tick["price"], "src": "Deriv"}
+        return dict(tick, applied=applied, yahoo_price=float(tick["y_live"]))
+    except Exception as exc:
+        print("V27 Analyze anchor error:", symbol, type(exc).__name__, exc)
+        return None
+
+
+# Deriv tick is the authoritative lifecycle price; no Twelve/AI/Yahoo quote fallback.
+_V27_OLD_ANALYZE_PLAN_LIFECYCLE = _analyze_plan_lifecycle
+def _analyze_plan_lifecycle(chat_id, symbol, a):
+    if getattr(_DERIV_CTX, "enabled", False):
+        tick = _deriv_quote(symbol)
+        if not tick:
+            return
+        a = dict(a)
+        a["live"] = float(tick["price"])
+    return _V27_OLD_ANALYZE_PLAN_LIFECYCLE(chat_id, symbol, a)
+
+
+# Wrap each alert worker's per-symbol work with a thread-local Deriv-only context.
+_V27_OLD_INSTANT_SCAN_GROUP = None
+_V27_OLD_SWING_ONE_SUB = None
+_V27_OLD_INSTANT_MONITOR_WORKER = _instant_monitor_worker
+_V27_OLD_ANALYZE_SWING_WORKER = _analyze_swing_alert_worker
+_V27_OLD_SWING_ANALYZE_ONE = _swing_analyze_one
+
+def _swing_analyze_one(chat_id, symbol):
+    previous = getattr(_DERIV_CTX, "enabled", False)
+    _DERIV_CTX.enabled = True
+    try:
+        return _V27_OLD_SWING_ANALYZE_ONE(chat_id, symbol)
+    finally:
+        _DERIV_CTX.enabled = previous
+
+
+def _instant_monitor_worker():
+    print("V27 Instant Alert worker: Deriv live price, 12s interval (5 scans/min)")
+    while True:
+        _cycle_started = time.time()
+        try:
+            # Reuse the existing subscription discovery and state engine unchanged.
+            with _pro_db() as con:
+                subs = con.execute("SELECT chat_id,symbol FROM instant_monitor_subscriptions WHERE active=1").fetchall()
+            configured = {cid for cid, _topic in _scalp_alert_targets(None)}
+            try:
+                with _pro_db() as con:
+                    configured |= {int(r[0]) for r in con.execute(
+                        "SELECT chat_id FROM alert_topic_registry WHERE category='instant'").fetchall()}
+            except Exception as exc:
+                print("V27 Instant topic registry:", exc)
+            if configured:
+                subs = list(subs) + [(cid, sym) for cid in configured for sym in V9_SCAN_SYMBOLS]
+            subs = list(dict.fromkeys((int(c), str(s)) for c, s in subs if s in SYMBOLS_MAP))
+            groups = {}
+            for chat_id, symbol in subs:
+                settings = get_settings(chat_id)
+                groups.setdefault((symbol, _settings_sig(settings)), {"settings": settings, "chats": []})["chats"].append(chat_id)
+            for (symbol, _), group in groups.items():
+                _DERIV_CTX.enabled = True
+                try:
+                    _INSTANT_CTX.data = None
+                    up, shift = _instant_tw_anchor(symbol)
+                    if up is None:
+                        continue
+                    _INSTANT_CTX.user_price, _INSTANT_CTX.user_shift = up, shift
+                    try:
+                        with _feature_data_access(allow_twelve=False):
+                            result = _view_instant_impl(symbol, group["settings"], force=False)
+                    finally:
+                        _INSTANT_CTX.user_price, _INSTANT_CTX.user_shift = None, 0.0
+                    if isinstance(result, tuple):
+                        continue
+                    ctx = getattr(_INSTANT_CTX, "data", None)
+                    lanes = _instant_lane_results(symbol, group["settings"], ctx, result) if ctx else None
+                    for chat_id in group["chats"]:
+                        try:
+                            if lanes:
+                                for lane, lane_result in lanes:
+                                    _instant_monitor_process(chat_id, symbol, lane_result, lane)
+                            else:
+                                _instant_monitor_process(chat_id, symbol, result)
+                        except Exception as exc:
+                            print("V27 Instant alert send:", chat_id, symbol, type(exc).__name__, exc)
+                except Exception as exc:
+                    print("V27 Instant scan:", symbol, type(exc).__name__, exc)
+                    traceback.print_exc()
+                finally:
+                    _DERIV_CTX.enabled = False
+            time.sleep(max(0.0, DERIV_SCAN_INTERVAL - (time.time() - _cycle_started)))
+        except Exception as exc:
+            print("V27 Instant worker error:", type(exc).__name__, exc)
+            traceback.print_exc()
+            time.sleep(max(0.0, DERIV_SCAN_INTERVAL - (time.time() - _cycle_started)))
+
+
+def _analyze_swing_alert_worker():
+    # Original worker retains its existing subscription routing and confirmed-event journal.
+    # SWING_ALERT_INTERVAL is set to 12s below; _swing_analyze_one opts into Deriv per thread.
+    return _V27_OLD_ANALYZE_SWING_WORKER()
+
+
+# Keep both alert workers at five scans per minute, regardless of slower legacy defaults.
+INSTANT_MONITOR_INTERVAL = int(DERIV_SCAN_INTERVAL)
+SWING_ALERT_INTERVAL = int(DERIV_SCAN_INTERVAL)
+
+BUILD_VERSION = "V27.0 DERIV ALERT FEED · 5 SCANS/MIN · EVENT-ONLY ALERTS"
+BUILD_LOG = [("V27.0", "Analyze Alert + Instant Alert use Deriv live ticks with shared cache and 55/min safety guard; both scan every 12 seconds; button features retain V26 Twelve Data scoping; alerts limited to Confirmation, Near Entry, Entry, TP1/TP2, SL, Cancel and Cut; BE/periodic/noise alerts suppressed")] + BUILD_LOG
 
 
 if __name__ == "__main__":
