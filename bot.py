@@ -20087,5 +20087,276 @@ def ai_router_status():
 BUILD_VERSION = "V25.5 SMART MULTI-AI ROUTER · FREE FIRST"
 BUILD_LOG = [("V25.5", "Additive free-first sequential AI routing: Groq -> OpenRouter Free -> Gemini; removes parallel duplicate requests from AI generation paths; adds cooldowns, short response cache, OpenRouter local safety caps and provider usage status; Python trading engines and Telegram routing preserved")] + BUILD_LOG
 
+
+# ============================================================================
+# V25.6 · SHARED XAUUSD SPOT PRICE HUB (Exness Standard compatible fallback)
+# IMPORTANT: Exness Standard MT accounts do not expose the Exness trading API.
+# This uses an independent indicative XAU/USD spot feed, NOT an Exness broker tick.
+# It is cached by the provider for ~60s and must never be described as broker Bid/Ask.
+# If the quote is stale/unavailable or disagrees too much with candle reference,
+# XAUUSD signal generation is blocked rather than silently using an old Yahoo price.
+# ============================================================================
+import datetime as _v256_datetime
+
+XAU_PRICE_API_URL = (os.environ.get("XAU_PRICE_API_URL") or
+                     "https://xaus.com/api/v1/spot?compact=1").strip()
+XAU_PRICE_CACHE_SECONDS = max(60, int(os.environ.get("XAU_PRICE_CACHE_SECONDS") or 65))
+XAU_PRICE_MAX_AGE_SECONDS = max(60, int(os.environ.get("XAU_PRICE_MAX_AGE_SECONDS") or 120))
+XAU_PRICE_MAX_BASIS_USD = float(os.environ.get("XAU_PRICE_MAX_BASIS_USD") or 15.0)
+XAU_PRICE_MAX_BASIS_PCT = float(os.environ.get("XAU_PRICE_MAX_BASIS_PCT") or 0.004)
+_XAU_PRICE_LOCK = threading.RLock()
+_XAU_PRICE_CACHE = {"t": 0.0, "price": None, "as_of": None, "source": "", "age": None, "error": "not fetched"}
+_XAU_BASIS = {"t": 0.0, "offset": None, "yahoo": None, "spot": None}
+_V256_PREV_FETCH_DATA = fetch_data
+_V256_PREV_GET_LIVE_PRICE = get_live_price
+_V256_PREV_VIEW_INSTANT = view_instant
+_V256_PREV_VIEW_INSTANT_IMPL = _view_instant_impl
+_V256_PREV_ANALYZE_LANE_PREPARE = _analyze_lane_prepare
+_V256_PREV_LANE_REAL_PRICE = _lane_real_price
+_V256_PREV_LANE_FETCH_TICK = _lane_fetch_tick
+_V256_PREV_RT_PRICE = rt_price
+_V256_PREV_AI_FEED_WANTED = _ai_feed_wanted
+_V256_PREV_BUILD_ANALYZE = build_analyze
+
+
+def _v256_parse_iso_epoch(value):
+    try:
+        if not value:
+            return None
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = _v256_datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _xau_external_quote(force=False):
+    """Return a verified fresh indicative XAU/USD spot quote; never use an AI-generated price."""
+    now = time.time()
+    with _XAU_PRICE_LOCK:
+        cached = dict(_XAU_PRICE_CACHE)
+        if (not force and cached.get("price") and
+                now - float(cached.get("t") or 0) < XAU_PRICE_CACHE_SECONDS):
+            return cached
+        try:
+            data = http_json(XAU_PRICE_API_URL, timeout=8)
+            if not isinstance(data, dict):
+                raise ValueError("API response is not a JSON object")
+            state = data.get("data_state") or {}
+            status = str(state.get("status") or "").lower()
+            if status != "fresh" or data.get("stale") is True:
+                raise ValueError("spot API reports stale/unavailable data")
+            price = _safe_num(data.get("spot_usd_oz"))
+            if price is None or price <= 0:
+                price = _safe_num((data.get("xau") or {}).get("price"))
+            if price is None or price <= 0:
+                raise ValueError("spot price missing/invalid")
+            as_of_text = data.get("price_as_of") or state.get("as_of") or data.get("updated_at")
+            as_of_epoch = _v256_parse_iso_epoch(as_of_text)
+            server_age = _safe_num(state.get("age_seconds"))
+            if as_of_epoch is None:
+                raise ValueError("price timestamp missing")
+            age = max(0.0, now - as_of_epoch)
+            if server_age is not None:
+                age = max(age, server_age)
+            if age > XAU_PRICE_MAX_AGE_SECONDS:
+                raise ValueError(f"spot quote stale ({int(age)}s)")
+            rec = {"t": now, "price": float(price), "as_of": str(as_of_text),
+                   "source": str(data.get("price_source") or state.get("source") or data.get("source") or "XAUS"),
+                   "age": int(age), "error": ""}
+            _XAU_PRICE_CACHE.update(rec)
+            return dict(rec)
+        except Exception as exc:
+            _XAU_PRICE_CACHE.update({"t": now, "price": None, "as_of": None,
+                                     "source": "XAUS", "age": None,
+                                     "error": f"{type(exc).__name__}: {str(exc)[:180]}"})
+            print("XAU SPOT API error:", _XAU_PRICE_CACHE["error"])
+            return dict(_XAU_PRICE_CACHE)
+
+
+def _xau_prepare_shared(force=False):
+    """Warm one common spot quote and align Yahoo candle scale to it; returns quote or None."""
+    q = _xau_external_quote(force=force)
+    if not q or q.get("price") is None:
+        _XAU_BASIS.update(t=0.0, offset=None, yahoo=None, spot=None)
+        return None
+    try:
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            y = _V256_PREV_FETCH_DATA("XAUUSD", "M1", force=False)
+        y_live = _safe_num(y[0]) if y and y[0] is not None else None
+    except Exception as exc:
+        print("XAU Yahoo reference error:", type(exc).__name__, exc)
+        y_live = None
+    if y_live is None or y_live <= 0:
+        _XAU_BASIS.update(t=q["t"], offset=None, yahoo=None, spot=q["price"])
+        return q
+    gap = float(q["price"]) - float(y_live)
+    allowed = max(XAU_PRICE_MAX_BASIS_USD, abs(float(q["price"])) * XAU_PRICE_MAX_BASIS_PCT)
+    if abs(gap) > allowed:
+        _XAU_BASIS.update(t=q["t"], offset=None, yahoo=y_live, spot=q["price"])
+        q["error"] = f"Spot/Yahoo reference gap too large: {gap:+.2f} USD (limit {allowed:.2f})"
+        print("XAU PRICE GUARD:", q["error"])
+        return None
+    _XAU_BASIS.update(t=q["t"], offset=gap, yahoo=y_live, spot=q["price"])
+    return q
+
+
+def _v256_shift_candles(candles, offset):
+    shifted = []
+    for c in (candles or []):
+        nc = Candle(c.open + offset, c.high + offset, c.low + offset,
+                    c.close + offset, c.ts, getattr(c, "volume", None))
+        for flag in ("synthetic", "realtime"):
+            if hasattr(c, flag):
+                setattr(nc, flag, getattr(c, flag))
+        shifted.append(nc)
+    return shifted
+
+
+def fetch_data(symbol, timeframe, force=False, allow_twelve=None):
+    """Keep all XAUUSD features on one spot price scale once a fresh quote is available."""
+    result = _V256_PREV_FETCH_DATA(symbol, timeframe, force, allow_twelve)
+    if symbol != "XAUUSD" or _anchor_on(symbol):
+        return result
+    rec = dict(_XAU_BASIS)
+    offset = rec.get("offset")
+    if offset is None or time.time() - float(rec.get("t") or 0) > XAU_PRICE_MAX_AGE_SECONDS:
+        return result
+    try:
+        p, prev, candles, n = result
+        if not candles:
+            return result
+        shifted = _v256_shift_candles(candles, float(offset))
+        return (p + offset if p is not None else p,
+                prev + offset if prev is not None else prev, shifted, n)
+    except Exception as exc:
+        print("XAU candle alignment warning:", type(exc).__name__, exc)
+        return result
+
+
+def _lane_fetch_tick(symbol):
+    if symbol != "XAUUSD":
+        return _V256_PREV_LANE_FETCH_TICK(symbol)
+    q = _xau_prepare_shared(force=False)
+    if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+        return None
+    return {"t": q["t"], "price": float(q["price"]), "src": "XAUS Spot (indicative)",
+            "y_live": float(_XAU_BASIS["yahoo"]), "shift": 0.0,
+            "as_of": q.get("as_of"), "age": q.get("age")}
+
+
+def _lane_real_price(symbol, base_s=60):
+    if symbol != "XAUUSD":
+        return _V256_PREV_LANE_REAL_PRICE(symbol, base_s)
+    lock = _TW_HUB_LOCKS.setdefault(symbol, threading.Lock())
+    with lock:
+        q = _xau_prepare_shared(force=False)
+        if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+            return None
+        return {"t": q["t"], "price": float(q["price"]), "src": "XAUS Spot (indicative)",
+                "y_live": float(_XAU_BASIS["yahoo"]), "shift": 0.0,
+                "as_of": q.get("as_of"), "age": q.get("age")}
+
+
+def get_live_price(symbol, force=False):
+    if symbol == "XAUUSD":
+        q = _xau_prepare_shared(force=force)
+        if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+            return None, "UNVERIFIED · " + str((q or {}).get("error") or "no fresh spot quote / candle reference")
+        return float(q["price"]), "XAUS Spot (indicative, not Exness Bid/Ask)"
+    return _V256_PREV_GET_LIVE_PRICE(symbol, force)
+
+
+def rt_price(symbol):
+    if symbol == "XAUUSD":
+        q = _xau_prepare_shared(force=False)
+        if q and q.get("price") is not None and _XAU_BASIS.get("offset") is not None:
+            return float(q["price"]), "XAUS Spot (indicative)"
+        return None, ""
+    return _V256_PREV_RT_PRICE(symbol)
+
+
+def _instant_tw_anchor(symbol):
+    if symbol != "XAUUSD":
+        return _V256_PREV_LANE_REAL_PRICE(symbol, INSTANT_TWELVE_EVERY_S), 0.0
+    tk = _lane_real_price(symbol, 60)
+    return (float(tk["price"]), 0.0) if tk else (None, 0.0)
+
+
+def _analyze_lane_prepare(symbol):
+    if symbol != "XAUUSD":
+        return _V256_PREV_ANALYZE_LANE_PREPARE(symbol)
+    tk = _lane_real_price(symbol, 60)
+    if not tk:
+        _ANCHOR.pop(symbol, None)
+        return
+    basis = float(tk["price"]) - float(tk["y_live"])
+    _ANCHOR[symbol] = {"t": tk["t"], "off": basis, "applied": basis,
+                       "price": float(tk["price"]), "src": tk["src"]}
+
+
+def _ai_feed_wanted(symbol=None):
+    if symbol == "XAUUSD":
+        return False
+    return _V256_PREV_AI_FEED_WANTED(symbol)
+
+
+def _view_instant_impl(symbol, s, force=False):
+    if symbol == "XAUUSD" and getattr(_INSTANT_CTX, "user_price", None) is None:
+        q = _xau_prepare_shared(force=False)
+        if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+            return error_card("No verified fresh XAU/USD spot quote. Signal paused; check the external spot feed and Yahoo candle reference.")
+        _INSTANT_CTX.user_price = float(q["price"])
+        _INSTANT_CTX.user_shift = 0.0
+        try:
+            return _V256_PREV_VIEW_INSTANT_IMPL(symbol, s, force)
+        finally:
+            _INSTANT_CTX.user_price = None
+            _INSTANT_CTX.user_shift = 0.0
+    return _V256_PREV_VIEW_INSTANT_IMPL(symbol, s, force)
+
+
+def view_instant(symbol, s, force=False, user_price=None):
+    if symbol == "XAUUSD" and user_price is None:
+        q = _xau_prepare_shared(force=False)
+        if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+            return error_card("No verified fresh XAU/USD spot quote. Instant signal paused; no Yahoo/AI fallback will be used.")
+        user_price = float(q["price"])
+    return _V256_PREV_VIEW_INSTANT(symbol, s, force, user_price)
+
+
+def build_analyze(symbol, *args, **kwargs):
+    if symbol == "XAUUSD":
+        q = _xau_prepare_shared(force=False)
+        if not q or q.get("price") is None or _XAU_BASIS.get("offset") is None:
+            return {"error": "No verified fresh XAU/USD spot quote. Analyze paused; no stale-price fallback."}
+    return _V256_PREV_BUILD_ANALYZE(symbol, *args, **kwargs)
+
+
+def xau_price_status():
+    """Admin/debug helper. No secrets are returned."""
+    q = dict(_XAU_PRICE_CACHE)
+    b = dict(_XAU_BASIS)
+    now = time.time()
+    return {"provider": "XAUS", "symbol": "XAU/USD spot (indicative)",
+            "price": q.get("price"), "quote_age_seconds": (int(now-q["t"]) if q.get("t") else None),
+            "source_timestamp": q.get("as_of"), "source_age_seconds": q.get("age"),
+            "status": "OK" if q.get("price") and b.get("offset") is not None and now-q["t"] <= XAU_PRICE_MAX_AGE_SECONDS else "BLOCKED",
+            "yahoo_reference": b.get("yahoo"), "spot_yahoo_offset": b.get("offset"),
+            "error": q.get("error") or ""}
+
+
+# Do not let Yahoo's Gold Futures contract masquerade as XAUUSD spot.
+try:
+    SYMBOLS_MAP["XAUUSD"]["yahoo"] = ["XAUUSD=X"]
+except Exception:
+    pass
+
+BUILD_VERSION = "V25.6 SHARED XAUUSD SPOT HUB · FAIL-CLOSED"
+BUILD_LOG = [("V25.6", "Shared XAUS indicative XAU/USD spot quote for Instant/Analyze/ICT live-price paths; timestamp/stale checks, Yahoo reference guard, spot-scale candle alignment, no AI/Yahoo price fallback for Instant/Analyze, removed GC=F fallback for XAUUSD. Does not provide Exness broker Bid/Ask.")] + BUILD_LOG
+print("V25.6 XAU SPOT HUB: XAUS external indicative spot feed · shared cache · stale/mismatch guard enabled")
+
 if __name__ == "__main__":
     main()
