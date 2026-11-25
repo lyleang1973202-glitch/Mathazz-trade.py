@@ -1,3 +1,4 @@
 # Required for the Professional PNG Chart renderer in MATHAZZ AI V25.3.
 matplotlib>=3.8,<4
 Pillow>=10,<13
+websocket-client>=1.8.0
