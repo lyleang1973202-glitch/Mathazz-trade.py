@@ -20102,8 +20102,8 @@ XAU_PRICE_API_URL = (os.environ.get("XAU_PRICE_API_URL") or
                      "https://xaus.com/api/v1/spot?compact=1").strip()
 XAU_PRICE_CACHE_SECONDS = max(60, int(os.environ.get("XAU_PRICE_CACHE_SECONDS") or 65))
 XAU_PRICE_MAX_AGE_SECONDS = max(60, int(os.environ.get("XAU_PRICE_MAX_AGE_SECONDS") or 120))
-XAU_PRICE_MAX_BASIS_USD = float(os.environ.get("XAU_PRICE_MAX_BASIS_USD") or 15.0)
-XAU_PRICE_MAX_BASIS_PCT = float(os.environ.get("XAU_PRICE_MAX_BASIS_PCT") or 0.004)
+XAU_PRICE_MAX_BASIS_USD = float(os.environ.get("XAU_PRICE_MAX_BASIS_USD") or 60.0)   # V25.7: wide enough for GC=F futures basis
+XAU_PRICE_MAX_BASIS_PCT = float(os.environ.get("XAU_PRICE_MAX_BASIS_PCT") or 0.015)
 _XAU_PRICE_LOCK = threading.RLock()
 _XAU_PRICE_CACHE = {"t": 0.0, "price": None, "as_of": None, "source": "", "age": None, "error": "not fetched"}
 _XAU_BASIS = {"t": 0.0, "offset": None, "yahoo": None, "spot": None}
@@ -20348,14 +20348,14 @@ def xau_price_status():
             "error": q.get("error") or ""}
 
 
-# Do not let Yahoo's Gold Futures contract masquerade as XAUUSD spot.
+# V25.7: GC=F is used ONLY as a candle/reference fallback; the live price still comes from the spot hub.
 try:
-    SYMBOLS_MAP["XAUUSD"]["yahoo"] = ["XAUUSD=X"]
+    SYMBOLS_MAP["XAUUSD"]["yahoo"] = ["XAUUSD=X", "GC=F"]   # V25.7: XAUUSD=X often 404s on Yahoo; GC=F is the candle fallback (spot-aligned by offset)
 except Exception:
     pass
 
-BUILD_VERSION = "V25.6 SHARED XAUUSD SPOT HUB · FAIL-CLOSED"
-BUILD_LOG = [("V25.6", "Shared XAUS indicative XAU/USD spot quote for Instant/Analyze/ICT live-price paths; timestamp/stale checks, Yahoo reference guard, spot-scale candle alignment, no AI/Yahoo price fallback for Instant/Analyze, removed GC=F fallback for XAUUSD. Does not provide Exness broker Bid/Ask.")] + BUILD_LOG
+BUILD_VERSION = "V25.7 XAUUSD YAHOO FALLBACK FIX · SPOT HUB · FAIL-CLOSED"
+BUILD_LOG = [("V25.7", "Hotfix: restored GC=F as Yahoo candle/reference fallback for XAUUSD (XAUUSD=X returns HTTP 404), widened spot/Yahoo basis guard defaults to 60 USD / 1.5% to tolerate futures basis. Live price still from spot hub.")] + [("V25.6", "Shared XAUS indicative XAU/USD spot quote for Instant/Analyze/ICT live-price paths; timestamp/stale checks, Yahoo reference guard, spot-scale candle alignment, no AI/Yahoo price fallback for Instant/Analyze, removed GC=F fallback for XAUUSD. Does not provide Exness broker Bid/Ask.")] + BUILD_LOG
 print("V25.6 XAU SPOT HUB: XAUS external indicative spot feed · shared cache · stale/mismatch guard enabled")
 
 if __name__ == "__main__":
