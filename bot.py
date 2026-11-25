@@ -20430,5 +20430,177 @@ BUILD_VERSION = "V27.0 DERIV ALERT FEED · 5 SCANS/MIN · EVENT-ONLY ALERTS"
 BUILD_LOG = [("V27.0", "Analyze Alert + Instant Alert use Deriv live ticks with shared cache and 55/min safety guard; both scan every 12 seconds; button features retain V26 Twelve Data scoping; alerts limited to Confirmation, Near Entry, Entry, TP1/TP2, SL, Cancel and Cut; BE/periodic/noise alerts suppressed")] + BUILD_LOG
 
 
+
+# =============================================================================
+# V27.1 · DERIV PRIMARY / YAHOO BACKUP HARDENING
+# Deriv is the authoritative live quote for Analyze Alert + Instant Alert.
+# Yahoo is a clearly-labelled fallback quote and the historical-candle backup.
+# A missing Yahoo anchor must never discard a valid Deriv live tick.
+# =============================================================================
+_V271_OLD_DERIV_ALERT_ANCHOR = _deriv_alert_anchor
+_V271_OLD_ANALYZE_PLAN_LIFECYCLE = _analyze_plan_lifecycle
+_V271_LOG_STATE = {"t": {}, "lock": threading.Lock()}
+
+def _v271_log_once(key, message, interval=300):
+    now = time.time()
+    with _V271_LOG_STATE["lock"]:
+        last = _V271_LOG_STATE["t"].get(key, 0.0)
+        if now - last < interval:
+            return
+        _V271_LOG_STATE["t"][key] = now
+    print(message)
+
+
+def _v271_yahoo_backup_quote(symbol):
+    """Yahoo quote is backup-only; it is never labelled as a Deriv tick."""
+    try:
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            row = fetch_data(symbol, "M1", force=False, allow_twelve=False)
+        if row and row[2]:
+            price = _safe_num(row[0])
+            if price is not None and price > 0:
+                return {"t": time.time(), "price": float(price), "src": "Yahoo_BACKUP",
+                        "symbol": str(symbol).upper(), "epoch": None}
+    except Exception as exc:
+        _v271_log_once(("yahoo-backup-error", str(symbol)),
+                       f"V27.1 Yahoo backup quote warning: {symbol} {type(exc).__name__}: {str(exc)[:100]}")
+    return None
+
+
+def _deriv_alert_anchor(symbol):
+    """Deriv live tick wins. Yahoo only supplies a fallback quote/candle basis."""
+    tick = _deriv_quote(symbol)
+    if tick:
+        try:
+            shift, y_live, err = _instant_anchor_prepare(symbol, tick["price"], force=False)
+            if err:
+                _v271_log_once(("deriv-yahoo-anchor", str(symbol)),
+                               f"V27.1: Deriv live tick active for {symbol}; Yahoo anchor unavailable/mismatched "
+                               f"({err[:100]}). Keeping Deriv price authoritative.")
+                y_live = None
+                shift = 0.0
+            return dict(tick, y_live=y_live, shift=float(shift or 0.0), live_src="Deriv")
+        except Exception as exc:
+            _v271_log_once(("deriv-anchor-exception", str(symbol)),
+                           f"V27.1 Deriv anchor note: {symbol} {type(exc).__name__}: {str(exc)[:100]}")
+            return dict(tick, y_live=None, shift=0.0, live_src="Deriv")
+
+    backup = _v271_yahoo_backup_quote(symbol)
+    if backup:
+        _v271_log_once(("deriv-fallback", str(symbol)),
+                       f"V27.1 WARNING: Deriv unavailable for {symbol}; temporarily using Yahoo BACKUP quote.")
+        try:
+            shift, y_live, err = _instant_anchor_prepare(symbol, backup["price"], force=False)
+            backup.update(y_live=y_live, shift=float(shift or 0.0), live_src="Yahoo_BACKUP")
+        except Exception:
+            backup.update(y_live=backup["price"], shift=0.0, live_src="Yahoo_BACKUP")
+        return backup
+
+    _v271_log_once(("all-quotes-down", str(symbol)),
+                   f"V27.1 ERROR: Deriv and Yahoo backup quotes unavailable for {symbol}; scan skipped.")
+    return None
+
+
+def _lane_fetch_tick(symbol):
+    """Alert workers: Deriv primary; Yahoo backup only when Deriv cannot return a quote."""
+    if getattr(_DERIV_CTX, "enabled", False):
+        tick = _deriv_alert_anchor(symbol)
+        if not tick:
+            return None
+        return {"t": tick["t"], "price": tick["price"],
+                "src": tick.get("live_src") or tick.get("src") or "Deriv",
+                "y_live": tick.get("y_live"), "shift": tick.get("shift", 0.0)}
+    return _V27_OLD_LANE_FETCH_TICK(symbol)
+
+
+def _instant_tw_anchor(symbol):
+    """Instant Alert uses Deriv first and Yahoo only as a labelled backup."""
+    tick = _deriv_alert_anchor(symbol)
+    if not tick:
+        return None, 0.0
+    return float(tick["price"]), float(tick.get("shift") or 0.0)
+
+
+def _analyze_lane_prepare(symbol):
+    if not getattr(_DERIV_CTX, "enabled", False):
+        return _V27_OLD_ANALYZE_LANE_PREPARE(symbol)
+    try:
+        tick = _deriv_alert_anchor(symbol)
+        if not tick:
+            return
+        # If Deriv is primary and Yahoo cannot provide a comparison price,
+        # preserve the Deriv tick and do not invent a synthetic price offset.
+        y_live = _safe_num(tick.get("y_live"))
+        if y_live is None or y_live <= 0:
+            _ANCHOR[symbol] = {"t": tick["t"], "off": 0.0, "applied": 0.0,
+                               "price": tick["price"], "src": tick.get("live_src", "Deriv")}
+            return
+        prev = _ANCHOR.get(symbol)
+        off_now = float(tick["price"]) - float(y_live)
+        basis = (0.6 * float(prev["off"]) + 0.4 * off_now) if prev and time.time() - float(prev.get("t", 0)) < 1800 else off_now
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            r5 = fetch_data(symbol, "M5", False, allow_twelve=False)
+        atr5 = calc_atr(r5[2]) if r5 and r5[2] else 0.0
+        applied = basis if (atr5 and abs(basis) >= 0.15 * atr5) else 0.0
+        _ANCHOR[symbol] = {"t": tick["t"], "off": basis, "applied": applied,
+                           "price": tick["price"], "src": tick.get("live_src", "Deriv")}
+    except Exception as exc:
+        _v271_log_once(("analyze-anchor", str(symbol)),
+                       f"V27.1 Analyze anchor warning: {symbol} {type(exc).__name__}: {str(exc)[:100]}")
+
+
+def _v21_refresh_real_price_anchor(symbol):
+    if not getattr(_DERIV_CTX, "enabled", False):
+        return _V27_OLD_V21_REFRESH(symbol)
+    tick = _deriv_alert_anchor(symbol)
+    if not tick:
+        return None
+    try:
+        y_live = _safe_num(tick.get("y_live"))
+        if y_live is None or y_live <= 0:
+            _ANCHOR[symbol] = {"t": tick["t"], "off": 0.0, "applied": 0.0,
+                               "price": tick["price"], "src": tick.get("live_src", "Deriv")}
+            return dict(tick, applied=0.0, yahoo_price=None)
+        prev = _ANCHOR.get(symbol)
+        off_now = float(tick["price"]) - float(y_live)
+        basis = (0.6 * float(prev["off"]) + 0.4 * off_now) if prev and time.time() - float(prev.get("t", 0)) < 1800 else off_now
+        with _feature_data_access(allow_twelve=False, anchor=False):
+            r5 = fetch_data(symbol, "M5", False, allow_twelve=False)
+        atr5 = calc_atr(r5[2]) if r5 and r5[2] else 0.0
+        applied = basis if (atr5 and abs(basis) >= 0.15 * atr5) else 0.0
+        _ANCHOR[symbol] = {"t": tick["t"], "off": basis, "applied": applied,
+                           "price": tick["price"], "src": tick.get("live_src", "Deriv")}
+        return dict(tick, applied=applied, yahoo_price=float(y_live))
+    except Exception as exc:
+        _v271_log_once(("refresh-anchor", str(symbol)),
+                       f"V27.1 anchor refresh warning: {symbol} {type(exc).__name__}: {str(exc)[:100]}")
+        return dict(tick, applied=0.0, yahoo_price=None)
+
+
+def _analyze_plan_lifecycle(chat_id, symbol, a):
+    if getattr(_DERIV_CTX, "enabled", False):
+        tick = _deriv_quote(symbol)
+        if tick:
+            a = dict(a)
+            a["live"] = float(tick["price"])
+        else:
+            # Yahoo is explicitly a backup only; preserve the source label for the event engine.
+            backup = _v271_yahoo_backup_quote(symbol)
+            if not backup:
+                return
+            a = dict(a)
+            a["live"] = float(backup["price"])
+            _v271_log_once(("lifecycle-yahoo", str(symbol)),
+                           f"V27.1 WARNING: Analyze lifecycle using Yahoo BACKUP for {symbol}; Deriv unavailable.")
+    return _V271_OLD_ANALYZE_PLAN_LIFECYCLE(chat_id, symbol, a)
+
+
+# Keep worker cadence deterministic: five complete scan cycles per minute.
+DERIV_SCAN_INTERVAL = 12.0
+INSTANT_MONITOR_INTERVAL = 12
+SWING_ALERT_INTERVAL = 12
+BUILD_VERSION = "V27.1 DERIV PRIMARY · YAHOO BACKUP · 5 SCANS/MIN"
+BUILD_LOG = [("V27.1", "Deriv is the authoritative live quote for Analyze/Instant alerts; Yahoo is a labelled backup quote and historical-candle fallback; valid Deriv ticks are never discarded because Yahoo anchor is missing; deduplicated feed warnings; both alert workers remain at 12-second cadence; existing event-only alert lifecycle and button feature provider scopes preserved")] + BUILD_LOG
+
 if __name__ == "__main__":
     main()
