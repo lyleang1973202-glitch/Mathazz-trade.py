@@ -18525,7 +18525,7 @@ def _lyli_chartimg_snapshot(timeframe, drawings=None):
         return None, "CHARTIMG_API_KEY_MISSING (add it in Railway Variables)"
     interval={"M1":"1m","M5":"5m","M15":"15m","M30":"30m","H1":"1h","H4":"4h"}.get(str(timeframe).upper(),"15m")
     body={"symbol":CHARTIMG_SYMBOL,"interval":interval,"width":1400,"height":900,
-          "theme":"dark","style":"candle","timezone":"Asia/Phnom_Penh","format":"png"}
+          "theme":"dark","style":"candle","timezone":"Etc/UTC","format":"png"}
     if drawings:
         body["drawings"]=drawings[:5]
     req=urllib.request.Request(
@@ -19379,6 +19379,17 @@ def _lilydebug_text(m, chat_id, user_id):
 
 BUILD_VERSION = "V25.3.6 LYLI · DELAYED-DATA FALLBACK IN CHAT"
 BUILD_LOG = [("V25.3.6", "Lily chat falls back to latest candle close (clearly labelled delayed, no signals) when no verified live tick exists; /lilydebug shows the live-quote failure reason")] + BUILD_LOG
+
+
+# =============================================================================
+# V25.3.9 · DASHBOARD UI + CHART-IMG TIMEZONE COMPATIBILITY
+# - Retains V25.3.8 dark dashboard renderer and compact Telegram caption.
+# - Uses the broadly supported Etc/UTC timezone in Chart-IMG requests; avoids
+#   the HTTP 422 caused by Asia/Phnom_Penh being rejected by the provider.
+# - Python chart remains available if Chart-IMG is unavailable.
+# =============================================================================
+BUILD_VERSION = "V25.3.9 LILY · DASHBOARD UI + CHARTIMG TIMEZONE FIX"
+BUILD_LOG = [("V25.3.9", "Retain V25.3.8 dashboard renderer/caption; Chart-IMG timezone changed from Asia/Phnom_Penh to Etc/UTC to resolve HTTP 422")] + BUILD_LOG
 
 
 if __name__ == "__main__":
