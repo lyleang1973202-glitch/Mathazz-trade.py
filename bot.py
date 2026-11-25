@@ -18951,5 +18951,119 @@ BUILD_VERSION = "V25.3.1 LYLI CHAT FIX · TOPIC + LIVE-DATA GATING"
 BUILD_LOG = [("V25.3.1", "Hotfix: 'chat' topic is a real category again (Lily answers in /topic set chat, no longer overwrites Analyze); Scan Zone legacy rows found; live data only for the symbol the user names (no default gold); 'sl'/'tp' word-boundary price gate; snapshot/Claude/DeepSeek prep bounded by timeouts; Lily always replies")] + BUILD_LOG
 
 
+
+# =============================================================================
+# V25.3.2 · LILY TOPIC DETECTION + DIAGNOSTICS
+# - Forum replies can arrive WITHOUT is_topic_message; the old _msg_thread then returned None,
+#   so a registered chat Topic was never matched and Lily stayed silent. Fixed via chat.is_forum.
+# - /lilydebug shows exactly what the bot sees (thread id, registered topics, privacy mode, keys).
+# - Ignored group messages are logged with the reason.
+# =============================================================================
+def _msg_thread(m):
+    """Forum-topic id of a message (None for General topic / non-forum chats)."""
+    tid = m.get("message_thread_id")
+    if tid is None:
+        return None
+    if m.get("is_topic_message") or (m.get("chat") or {}).get("is_forum"):
+        return tid
+    return None
+
+
+def _lilydebug_text(m, chat_id, user_id):
+    chat = m.get("chat") or {}
+    thread = _msg_thread(m)
+    private = chat.get("type") == "private"
+    try:
+        should = chat_should_answer(chat_id, thread, private, m)
+    except Exception as exc:
+        should = "ERROR %s" % type(exc).__name__
+    me = tg("getMe", _t=10) or {}
+    res = me.get("result") or {}
+    can_read = res.get("can_read_all_group_messages")
+    lines = [
+        "🛠 <b>Lily Debug</b>", "━━━━━━━━━━━━━━",
+        "Chat type: <code>%s</code> · forum: <code>%s</code>" % (html.escape(str(chat.get("type"))), chat.get("is_forum")),
+        "message_thread_id: <code>%s</code> · is_topic_message: <code>%s</code>" % (m.get("message_thread_id"), m.get("is_topic_message")),
+        "Thread ដែលបូតយល់: <code>%s</code>" % thread,
+        "CHAT_ENABLED: <code>%s</code> · chat topic active: <code>%s</code>" % (CHAT_ENABLED, _chat_topic_active(chat_id, thread)),
+        "Lily ឆ្លើយសារធម្មតាក្នុងទីនេះ: <b>%s</b>" % should,
+        "AI keys: Gemini=%s · Groq=%s" % (bool(GEMINI_API_KEY), bool(GROQ_API_KEY)),
+        "Bot: @%s · អានគ្រប់សារក្នុង Group (privacy off): <code>%s</code>" % (html.escape(str(res.get("username"))), can_read),
+        "━━━━━━━━━━━━━━",
+    ]
+    try:
+        lines.append(_topic_registry_text(chat_id))
+    except Exception as exc:
+        lines.append("Topic registry error: " + html.escape(type(exc).__name__))
+    if can_read is False and not private:
+        lines.append("\n⚠️ Privacy Mode នៅបើក → Telegram មិនផ្ញើសារធម្មតាមកបូតទេ។ "
+                     "BotFather → /mybots → Bot Settings → Group Privacy → Turn off, "
+                     "បន្ទាប់មកដកបូតចេញពី Group ហើយបន្ថែមវិញ ឬដាក់ជា Admin។")
+    return "\n".join(lines)
+
+
+_LYLI_V2532_PREV_HANDLE_UPDATE = handle_update
+
+
+def handle_update(update):
+    try:
+        m = update.get("message") or {}
+        txt = (m.get("text") or "").strip()
+        if txt:
+            chat_id = (m.get("chat") or {}).get("id")
+            user_id = (m.get("from") or {}).get("id")
+            first = txt.split()[0].lower().split("@", 1)[0]
+            if first == "/lilydebug" and chat_id is not None:
+                _TG_CTX.v = {"chat_id": chat_id, "thread_id": _msg_thread(m)}
+                tg("sendMessage", chat_id=chat_id, text=_lilydebug_text(m, chat_id, user_id), parse_mode="HTML")
+                return
+            if not txt.startswith("/") and chat_id is not None and (m.get("chat") or {}).get("type") != "private":
+                th = _msg_thread(m)
+                if not chat_should_answer(chat_id, th, False, m):
+                    print("Lily ignored group text: chat=%s thread=%s (Topic not registered as 'chat' and /chat on not set)" % (chat_id, th))
+    except Exception as exc:
+        print("V25.3.2 pre-router:", type(exc).__name__, exc)
+    return _LYLI_V2532_PREV_HANDLE_UPDATE(update)
+
+
+BUILD_VERSION = "V25.3.2 LYLI CHAT FIX · TOPIC DETECTION + /lilydebug"
+BUILD_LOG = [("V25.3.2", "Forum topic id detected via chat.is_forum when is_topic_message is missing; /lilydebug diagnostics (shows privacy mode, topic id, registry); ignored group messages logged")] + BUILD_LOG
+
+
+
+# =============================================================================
+# V25.3.3 · LILY USES GEMINI + GROQ ONLY
+# Claude / DeepSeek reviewers are OFF by default (no more 401 / 402 messages).
+# To turn them back on later: set LYLI_EXTERNAL_REVIEWERS=1 in Railway (and valid keys/credits).
+# =============================================================================
+LYLI_EXTERNAL_REVIEWERS = (os.environ.get("LYLI_EXTERNAL_REVIEWERS") or "0").strip().lower() in ("1", "true", "yes", "on")
+if not LYLI_EXTERNAL_REVIEWERS:
+    ANTHROPIC_API_KEY = ""
+    DEEPSEEK_API_KEY = ""
+    LYLI_AI_FANOUT_ENABLED = False
+
+_LYLI_V2533_PREV_TEXT_REVIEWS = _lyli_text_ai_reviews
+
+
+def _lyli_text_ai_reviews(question, snapshot):
+    if not LYLI_EXTERNAL_REVIEWERS or not LYLI_AI_FANOUT_ENABLED:
+        return {}                                   # nothing is added to Lily's prompt
+    return _LYLI_V2533_PREV_TEXT_REVIEWS(question, snapshot)
+
+
+def _lyli_review_summary(reviews):
+    """Show only reviews that really succeeded; never post provider errors (401/402/not_configured) to the Topic."""
+    parts = []
+    for name in ("claude", "deepseek"):
+        r = (reviews or {}).get(name, {})
+        if r.get("status") == "ok":
+            parts.append(name.upper() + " REVIEW:\n" + str(r.get("review", ""))[:1800])
+    return "\n\n".join(parts)
+
+
+BUILD_VERSION = "V25.3.3 LYLI · GEMINI + GROQ ONLY"
+BUILD_LOG = [("V25.3.3", "Claude/DeepSeek reviewers disabled by default (LYLI_EXTERNAL_REVIEWERS=1 re-enables); provider error messages are never posted; Lily answers with Gemini, falling back to Groq")] + BUILD_LOG
+
+
 if __name__ == "__main__":
     main()
