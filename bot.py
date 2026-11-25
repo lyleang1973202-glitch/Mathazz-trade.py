@@ -21047,5 +21047,154 @@ BUILD_LOG = [
 ] + BUILD_LOG
 
 
+# =============================================================================
+# V27.4 · LILY TWELVE DATA PIPELINE FIX
+#
+# Root causes addressed:
+# 1) The old provider override relied on _TWELVE_FEATURE_CTX (thread-local).
+#    build_ict_analysis() creates worker threads, so this flag did not propagate.
+#    _DATA_ACCESS.allow_twelve IS explicitly propagated to those workers; use that
+#    feature permission as the source-of-truth for Twelve-first provider routing.
+# 2) A cached Yahoo snapshot could be returned before attempting Twelve again.
+#    Non-Twelve cached Lily snapshots are invalidated.
+# 3) Twelve /price failures were swallowed with no actionable diagnostic. Keep a
+#    safe status record (never the API key) for an admin-only /lilydebug command.
+# =============================================================================
+
+_LILY_TWELVE_DIAG = {
+    "at": 0.0, "status": "NOT_TESTED", "detail": "No Twelve Data request yet",
+    "price": None, "source": None
+}
+_LILY_TWELVE_DIAG_LOCK = threading.Lock()
+
+def _lily_tw_diag(status, detail, price=None):
+    with _LILY_TWELVE_DIAG_LOCK:
+        _LILY_TWELVE_DIAG.update(
+            at=time.time(), status=str(status), detail=str(detail)[:240],
+            price=float(price) if price is not None else None,
+            source="Twelve Data" if price is not None else None
+        )
+
+# Reassert Twelve-first whenever the feature-scoped permission is active.
+# _DATA_ACCESS is copied into build_ict_analysis worker threads, unlike the
+# separate _TWELVE_FEATURE_CTX thread-local flag.
+_V274_OLD_PROVIDER_ORDER = _provider_order
+def _provider_order(symbol, timeframe=None):
+    if _twelve_allowed() and _twelve_has_key():
+        allowed_tfs = getattr(_DATA_ACCESS, "timeframes", None)
+        if allowed_tfs is None or timeframe in allowed_tfs:
+            if _TWELVE_COOLDOWN["until"] > time.time():
+                return ["yahoo"]  # documented fallback during Twelve cooldown
+            return ["twelve", "yahoo"]
+    return _V274_OLD_PROVIDER_ORDER(symbol, timeframe)
+
+# Instrument the existing guarded Twelve /price implementation without
+# exposing secrets or changing its request budget / response parsing.
+_V274_OLD_RT_TWELVE = _rt_twelve
+def _rt_twelve(symbol):
+    if not _twelve_has_key():
+        _lily_tw_diag("MISSING_API_KEY", "TWELVE_DATA_API_KEY is not configured in the running service")
+        return None
+    if DATA_PROVIDER == "yahoo" and not getattr(_TWELVE_FEATURE_CTX, "force_primary", False):
+        _lily_tw_diag("BLOCKED_BY_PROVIDER_SETTING", "DATA_PROVIDER=yahoo and Lily Twelve-primary scope is not active")
+        return None
+    if _TWELVE_COOLDOWN["until"] > time.time():
+        _lily_tw_diag("COOLDOWN", "Twelve Data is in provider cooldown; check quota/rate-limit errors")
+        return None
+    try:
+        if not _tw_ledger_can(1):
+            _lily_tw_diag("CREDIT_BUDGET", "Twelve Data credit ledger blocked the /price request")
+            return None
+    except Exception:
+        pass
+    try:
+        price = _V274_OLD_RT_TWELVE(symbol)
+    except Exception as exc:
+        _lily_tw_diag("REQUEST_EXCEPTION", f"{type(exc).__name__}: {str(exc)[:160]}")
+        return None
+    if price is not None and float(price) > 0:
+        _lily_tw_diag("OK", "Twelve Data /price returned a positive price", float(price))
+        return float(price)
+    last = _TWELVE_LAST_ERR.get(str(symbol).upper())
+    detail = str(last[1]) if last else "Twelve Data /price returned no usable price; inspect Railway logs and API quota"
+    _lily_tw_diag("NO_PRICE", detail)
+    return None
+
+# Prevent the prior snapshot cache from serving an old Yahoo result as Lily's
+# current primary quote. Keep valid Twelve snapshots reusable.
+_V274_OLD_LILY_SNAPSHOT = _lily_market_snapshot
+def _lily_market_snapshot(force=False):
+    try:
+        with _LILY_SNAPSHOT_LOCK:
+            cached = _LILY_SNAPSHOT_CACHE.get("value")
+            if cached and not str(cached.get("source", "")).startswith("Twelve Data"):
+                _LILY_SNAPSHOT_CACHE.clear()
+    except Exception:
+        pass
+    with _twelve_primary_scope(), _feature_data_access(allow_twelve=True, anchor=False):
+        result = _V274_OLD_LILY_SNAPSHOT(force=force)
+    try:
+        snap, err = result
+        if snap and str(snap.get("source", "")).startswith("Twelve Data"):
+            _lily_tw_diag("OK", "Lily snapshot is using Twelve Data /price", snap.get("price"))
+        elif snap:
+            _lily_tw_diag("BACKUP", str(snap.get("source") or "Yahoo backup") + " · " + str(snap.get("quote_error") or "Twelve Data unavailable"))
+        elif err:
+            _lily_tw_diag("SNAPSHOT_FAILED", err)
+    except Exception:
+        pass
+    return result
+
+def _lily_debug_text():
+    with _LILY_TWELVE_DIAG_LOCK:
+        d = dict(_LILY_TWELVE_DIAG)
+    age = (time.time() - d["at"]) if d.get("at") else None
+    price = "—" if d.get("price") is None else f'{float(d["price"]):.5f}'
+    age_text = "—" if age is None else f"{age:.0f}s ago"
+    return (
+        "🌸 <b>LILY · TWELVE DATA DIAGNOSTIC</b>\\n"
+        f"API key configured: <b>{'YES' if _twelve_has_key() else 'NO'}</b>\\n"
+        f"DATA_PROVIDER: <b>{html.escape(DATA_PROVIDER)}</b>\\n"
+        f"Lily feature policy: <b>{'Twelve-first' if _twelve_has_key() else 'Yahoo backup only (API key missing)'}</b>\\n"
+        f"Cooldown active: <b>{'YES' if _TWELVE_COOLDOWN.get('until', 0) > time.time() else 'NO'}</b>\\n"
+        f"Last status: <b>{html.escape(str(d.get('status')))}</b>\\n"
+        f"Last detail: <code>{html.escape(str(d.get('detail') or '—'))}</code>\\n"
+        f"Last Twelve price: <b>{price}</b>\\n"
+        f"Updated: <b>{age_text}</b>\\n\\n"
+        "This diagnostic never displays the API key."
+    )
+
+_V274_OLD_HANDLE_UPDATE = handle_update
+def handle_update(update):
+    try:
+        msg = (update or {}).get("message") or {}
+        txt = (msg.get("text") or "").strip()
+        if txt.split(maxsplit=1)[0].lower().split("@", 1)[0] == "/lilydebug":
+            chat_id = (msg.get("chat") or {}).get("id")
+            user_id = (msg.get("from") or {}).get("id")
+            if chat_id is not None:
+                if not is_admin(user_id):
+                    tg("sendMessage", chat_id=chat_id, text="⛔ Admin only.")
+                else:
+                    # Force a fresh snapshot so this command tests the live Lily path.
+                    snap, err = _lily_market_snapshot(force=True)
+                    body = _lily_debug_text()
+                    if snap:
+                        body += "\\n\\nSnapshot source: <b>" + html.escape(str(snap.get("source") or "unknown")) + "</b>"
+                    elif err:
+                        body += "\\n\\nSnapshot error: <code>" + html.escape(str(err)[:300]) + "</code>"
+                    tg("sendMessage", chat_id=chat_id, text=body, parse_mode="HTML")
+                return
+    except Exception as exc:
+        print("V27.4 Lily debug command error:", type(exc).__name__, str(exc)[:160])
+    return _V274_OLD_HANDLE_UPDATE(update)
+
+BUILD_VERSION = "V27.4 LILY TWELVE DATA PIPELINE FIX"
+BUILD_LOG = [
+    ("V27.4", "Fixed Twelve-first routing in build_ict_analysis worker threads by using propagated feature permission; invalidates non-Twelve Lily snapshot cache; adds safe admin-only /lilydebug status for API key presence, cooldown, credit guard, last Twelve response and snapshot source")
+] + BUILD_LOG
+
+
+
 if __name__ == "__main__":
     main()
