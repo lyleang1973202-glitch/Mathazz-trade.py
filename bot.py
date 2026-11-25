@@ -19197,5 +19197,92 @@ BUILD_VERSION = "V25.3.5 LYLI · CHART REPLIES IN REQUESTING TOPIC"
 BUILD_LOG = [("V25.3.5", "Chart, caption, TradingView image and errors are posted in the Topic where the user asked (not forced to Analyze); scheduled Analyze alerts unchanged")] + BUILD_LOG
 
 
+
+# =============================================================================
+# V25.3.6 · LILY CHAT: NEVER REFUSE WHEN DELAYED CANDLE DATA EXISTS
+# Cause of "មិនទាន់ទទួលបាន Live XAUUSD quote": the verified tick needs a working TWELVE_DATA_API_KEY
+# (or a Gemini/Groq quote that agrees with Yahoo). When none works, Lily refused outright even though
+# the bot already holds recent candles. Now, ONLY inside Lily's chat answer, she falls back to the latest
+# candle close, clearly labelled DELAYED / not a live tick. Alerts, /market and signal workers still
+# require a verified live quote (the fallback is thread-local to chat and never cached).
+# =============================================================================
+_LYLI_LAST_QUOTE_ERR = {"t": 0.0, "err": ""}
+_LYLI_V2536_PREV_MARKET_SNAPSHOT = _lily_market_snapshot
+
+
+def _lily_market_snapshot(force=False):
+    snap, err = _LYLI_V2536_PREV_MARKET_SNAPSHOT(force)
+    if snap:
+        return snap, err
+    _LYLI_LAST_QUOTE_ERR.update(t=time.time(), err=str(err))
+    print("Lily live quote unavailable:", err)
+    if not getattr(_LYLI_CHAT_CTX, "allow_delayed", False):
+        return snap, err                                  # workers / /market keep the strict rule
+    try:
+        fb, ferr = _lyli_bounded(_lyli_live_snapshot, LYLI_CHAT_SNAPSHOT_TIMEOUT, LILY_SYMBOL, ("M1", "M5"), False)
+        if not fb or not fb.get("ok"):
+            _LYLI_LAST_QUOTE_ERR["err"] = "%s | fallback: %s" % (err, ferr or (fb or {}).get("error"))
+            return None, err
+        row = fb["rows"].get("M1") or fb["rows"].get("M5") or next(iter(fb["rows"].values()))
+        age = row.get("age_seconds")
+        analysis = {}
+        try:
+            a = build_ict_analysis(LILY_SYMBOL, force=False)
+            if isinstance(a, dict) and not a.get("error"):
+                analysis = a
+        except Exception as exc:
+            print("Lily fallback ICT analysis:", type(exc).__name__, exc)
+        return {"symbol": LILY_SYMBOL, "price": float(row["price"]),
+                "source": str(row.get("source") or "candle feed") + " (DELAYED candle close)",
+                "as_of": time.time() - (age or 0), "age_s": float(age if age is not None else 0),
+                "analysis": analysis, "plan": analysis.get("plan") if analysis else None,
+                "delayed": True, "candle_time": row.get("candle_time"), "quote_error": str(err)}, ""
+    except Exception as exc:
+        print("Lily delayed fallback failed:", type(exc).__name__, exc)
+        return None, err
+
+
+_LYLI_V2536_PREV_SNAP_TEXT = _lily_snapshot_prompt_text
+
+
+def _lily_snapshot_prompt_text(snap):
+    base = _LYLI_V2536_PREV_SNAP_TEXT(snap)
+    if not snap.get("delayed"):
+        return base
+    return ("DELAYED DATA WARNING: no verified live tick is available (%s). The price below is the LATEST CANDLE CLOSE "
+            "from the market-data feed, candle time %s (about %d min old), NOT a live broker quote. "
+            "Tell the user plainly it is delayed, give it with its time, and do NOT give entry/SL/TP signals from it; "
+            "advise waiting for a verified live quote or checking their own platform. "
+            % (snap.get("quote_error"), snap.get("candle_time"), int((snap.get("age_s") or 0) // 60))) + base
+
+
+_LYLI_V2536_PREV_CHAT_ANSWER = chat_answer
+
+
+def chat_answer(chat_id, thread_id, user_id, question):
+    _LYLI_CHAT_CTX.allow_delayed = True
+    try:
+        return _LYLI_V2536_PREV_CHAT_ANSWER(chat_id, thread_id, user_id, question)
+    finally:
+        _LYLI_CHAT_CTX.allow_delayed = False
+
+
+_LYLI_V2536_PREV_DEBUG = _lilydebug_text
+
+
+def _lilydebug_text(m, chat_id, user_id):
+    txt = _LYLI_V2536_PREV_DEBUG(m, chat_id, user_id)
+    e = _LYLI_LAST_QUOTE_ERR
+    line = ("Live quote ចុងក្រោយបរាជ័យ: <code>%s</code> (%ds មុន)" % (html.escape(e["err"]), int(time.time() - e["t"]))
+            if e["err"] else "Live quote: មិនទាន់មានបរាជ័យ")
+    twelve = "មាន" if _twelve_has_key() else "គ្មាន"
+    return txt + "\n━━━━━━━━━━━━━━\n" + line + "\nTWELVE_DATA_API_KEY: %s · DATA_PROVIDER=%s · INSTANT_AI_FEED=%s" % (
+        twelve, DATA_PROVIDER, INSTANT_AI_FEED)
+
+
+BUILD_VERSION = "V25.3.6 LYLI · DELAYED-DATA FALLBACK IN CHAT"
+BUILD_LOG = [("V25.3.6", "Lily chat falls back to latest candle close (clearly labelled delayed, no signals) when no verified live tick exists; /lilydebug shows the live-quote failure reason")] + BUILD_LOG
+
+
 if __name__ == "__main__":
     main()
