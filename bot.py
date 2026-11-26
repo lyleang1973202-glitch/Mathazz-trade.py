@@ -7465,7 +7465,7 @@ def _image_symbol_match(instrument_text, selected_symbol):
     """Return (recognized_symbol, match_status). Never infer a symbol from selection alone."""
     raw = str(instrument_text or "").upper().replace(" ", "").replace("_", "").replace("-", "")
     aliases = {
-        "XAUUSD": ("XAUUSD", "XAU/USD", "GOLD", "GOLDUSD", "GC=F"),
+        "XAUUSD": ("XAUUSD", "XAU/USD", "GOLD", "GOLDUSD"),
         "BTCUSD": ("BTCUSD", "BTC/USD", "BITCOIN", "BTCUSDT", "BTC-USD"),
         "ETHUSD": ("ETHUSD", "ETH/USD", "ETHEREUM", "ETHUSDT", "ETH-USD"),
         "EURUSD": ("EURUSD", "EUR/USD"),
@@ -12230,7 +12230,13 @@ def _tw_sync_plan(force=False):
         d = http_json("https://api.twelvedata.com/api_usage?" +
                       urllib.parse.urlencode({"apikey": TWELVE_DATA_API_KEY}), timeout=6)
     except Exception as exc:
-        print("V16 api_usage:", type(exc).__name__)
+        _api_code = getattr(exc, "code", None)
+        _api_body = ""
+        try:
+            _api_body = exc.read().decode("utf-8", "replace")[:240]
+        except Exception:
+            pass
+        print("V16 api_usage:", type(exc).__name__, "HTTP", _api_code or "n/a", _api_body)
         return False
     if not isinstance(d, dict) or str(d.get("status", "")).lower() == "error":
         return False
@@ -21315,6 +21321,77 @@ You are កញ្ញាលីលី, a disciplined institutional-style market ad
 # microstructure path; external background scanners remain unchanged.
 BUILD_VERSION = "V27.5 LILY DEEP PYTHON ADVISOR · TWELVE-FIRST · NO MANUAL PRICE"
 BUILD_LOG = [("V27.5", "Lily deep Python evidence brief: seven-TF ICT/SMC, candle patterns, ATR regime, optional OHLCV profile, fused intelligence and microstructure; Twelve-first M1/M5; no manual-price prompts; Deriv/Yahoo remain explicit fallbacks")] + BUILD_LOG
+
+
+# =============================================================================
+# V27.6 · SPOT DATA INTEGRITY + TRANSPARENT PROVIDER DIAGNOSTICS
+# =============================================================================
+# XAUUSD is a spot symbol. GC=F is a COMEX futures contract and must never be
+# silently substituted for spot candles. Keep Yahoo's XAUUSD=X only as a
+# clearly-labelled backup; Twelve Data remains Lily's first-choice feed.
+SYMBOLS_MAP["XAUUSD"]["yahoo"] = ["XAUUSD=X"]
+_YF_GOOD.pop("XAUUSD", None)
+
+def _lily_source_report():
+    """Current quote and candle provenance; configured keys are not proof of live data."""
+    snap = (_LILY_SNAPSHOT_CACHE.get("value") or {})
+    quote_src = str(snap.get("source") or "unavailable")
+    quote_age = None
+    try:
+        quote_age = max(0, int(time.time() - float(snap.get("as_of")))) if snap.get("as_of") else None
+    except Exception:
+        quote_age = None
+    tfs = ("H4", "H2", "H1", "M30", "M15", "M5", "M1")
+    candle_sources = []
+    for tf in tfs:
+        src = _SRC.get((LILY_SYMBOL, tf)) or "not fetched"
+        candle_sources.append(f"{tf}:{src}")
+    tw_live = quote_src.lower().startswith("twelve data")
+    return {"quote_source": quote_src, "quote_age": quote_age,
+            "twelve_key_configured": _twelve_has_key(), "twelve_quote_live": tw_live,
+            "candles": candle_sources}
+
+_V275_LILY_ADVISOR_BRIEF = _lily_advisor_brief
+def _lily_advisor_brief(chat_id):
+    brief = _V275_LILY_ADVISOR_BRIEF(chat_id)
+    report = _lily_source_report()
+    source_line = (
+        "\nDATA PROVENANCE (runtime evidence, not configuration): "
+        f"Twelve API key configured={report['twelve_key_configured']}; "
+        f"actual live quote source={report['quote_source']}; "
+        f"quote age={report['quote_age'] if report['quote_age'] is not None else 'unknown'}s; "
+        f"Twelve actually supplied quote={report['twelve_quote_live']}. "
+        "Candle providers: " + ", ".join(report['candles']) + ". "
+        "GC=F is prohibited as XAUUSD spot data. If candle sources differ from the quote source, "
+        "explicitly disclose the mixed-source basis and reduce confidence; never call it a fully Twelve-sourced snapshot."
+    )
+    return brief + source_line
+
+_LILY_ADV_RULES += """
+\n=== V27.6 DATA-INTEGRITY OVERRIDE ===
+- Never describe Twelve Data as currently connected merely because its API key exists. Confirm the actual quote source and per-timeframe candle providers in DATA PROVENANCE.
+- XAUUSD means spot gold only. GC=F is COMEX futures and is NOT an acceptable XAUUSD spot substitute.
+- If the quote is Deriv, say Deriv; if it is Yahoo BACKUP, say Yahoo backup/delayed as indicated. Do not call either Twelve Data.
+- If quote and candle providers are mixed, explicitly disclose that fact and do not claim the entire analysis is Twelve Data live.
+- If no verified quote is available, WAIT and do not produce current numeric entry levels.
+"""
+
+_V275_LILY_MARKET_COMMAND = _lily_market_command
+def _lily_market_command(chat_id):
+    result = _V275_LILY_MARKET_COMMAND(chat_id)
+    report = _lily_source_report()
+    provenance = (
+        "\n\n<b>DATA SOURCE CHECK</b>\n"
+        f"Live quote: <b>{html.escape(report['quote_source'])}</b>"
+        + (f" · {report['quote_age']}s old" if report['quote_age'] is not None else "")
+        + "\nCandles: " + html.escape(" | ".join(report['candles']))
+        + "\nTwelve key configured: " + ("YES" if report['twelve_key_configured'] else "NO")
+        + " · Twelve supplied this quote: " + ("YES" if report['twelve_quote_live'] else "NO")
+    )
+    return result + provenance
+
+BUILD_VERSION = "V27.6 SPOT DATA INTEGRITY · TWELVE PROVENANCE · NO GC=F SPOT FALLBACK"
+BUILD_LOG = [("V27.6", "Removed GC=F from XAUUSD spot fallbacks; Twelve/Deriv/Yahoo source provenance shown per live quote and timeframe; Lily instructed not to equate configured API key with actual Twelve usage; improved Twelve api_usage HTTP diagnostics; all existing engines retained")] + BUILD_LOG
 
 
 if __name__ == "__main__":
