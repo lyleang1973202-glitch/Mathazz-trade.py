@@ -13748,11 +13748,12 @@ def chat_answer(chat_id, thread_id, user_id, question):
                         "សូមសាកម្ដងទៀតក្រោយបន្តិច។ ខ្ញុំនឹងមិនទាយតម្លៃ ឬបង្កើតសញ្ញាដោយគ្មានទិន្នន័យទេ។")
             parts.append("=== BOT LIVE SNAPSHOT XAUUSD ===\n" + _lily_snapshot_prompt_text(live_snap))
         elif user_price is None:
-            with CHAT_LOCK:
-                CHAT_PENDING[key] = {"symbol": sym, "question": question, "t": time.time()}
-            return (f"📍 <b>{html.escape(sym)}</b> តម្លៃឥឡូវប៉ុន្មាន?\n"
-                    "វាយលេខតែម្ដង ឧ. <code>1.0850</code>\n"
-                    "💡 សម្រាប់ Symbol ផ្សេងពី Gold សូមផ្ដល់តម្លៃបច្ចុប្បន្ន ឬប្រើ Dashboard របស់វា។")
+            # Never request a manually typed quote. Lily's live-advisor feed
+            # currently auto-analyzes XAUUSD; other symbols use their own
+            # market dashboards until symbol-aware Lily snapshots are enabled.
+            return (f"🌸 <b>កញ្ញាលីលី</b>៖ ខ្ញុំមិនស្នើឱ្យលោកម្ចាស់វាយតម្លៃដោយដៃទេ។\n"
+                    f"Auto live analysis សម្រាប់ <b>{html.escape(LILY_SYMBOL)}</b> ប៉ុណ្ណោះនៅក្នុង Lily Advisor។\n"
+                    f"សម្រាប់ <b>{html.escape(sym)}</b> សូមប្រើ Dashboard របស់ Symbol នោះ ដើម្បីទទួលទិន្នន័យដែលបានផ្ទៀងផ្ទាត់។")
         if user_price is not None:
             tg("sendChatAction", chat_id=chat_id, action="typing")
             snap, err = _chat_live_snapshot(sym, user_price)
@@ -17826,7 +17827,7 @@ def _lily_micro_analysis(force=False):
         if age > LILY_MAX_QUOTE_AGE_S:
             return None, "LIVE_QUOTE_STALE"
         frames = {}
-        with _feature_data_access(allow_twelve=False, lock=True, anchor=True):
+        with _twelve_primary_scope(True), _feature_data_access(allow_twelve=True, lock=True, anchor=False):
             for tf in ("M5", "M1"):
                 _live, _src, cands, _cnt = fetch_data(LILY_SYMBOL, tf, bool(force))
                 if cands:
@@ -20845,11 +20846,21 @@ _LILY_ADV_EXTRA = ("ប្រឹក្សា", "គួរ", "ចូល", "ទិ
                    "swing", "good time", "opinion", "view", "outlook", "forecast", "xau", "gold")
 
 
+_LILY_ADV_SKIP = ("def ", "traceback", "import ", "syntax", "python code", "កូដ", "bug", "railway", "pip install", "requirements")
+_LILY_ADV_GREET = ("hi", "hello", "hey", "សួស្តី", "សួរស្តី", "អរគុណ", "thanks", "thank you", "ok", "បាទ", "ចាស")
+
+
 def _lily_adv_wants(question):
-    q = str(question or "").lower()
-    if any(w in q for w in ("def ", "traceback", "import ", "syntax", "python code", "កូដ", "bug")) and not _lily_wants_price(q):
+    """Lily is a market advisor: the brief is attached to EVERY message except code/bot-setup talk and pure greetings,
+    so follow-ups like 'what does that mean?' or 'I enabled Twelve' still see the live market."""
+    q = str(question or "").strip().lower()
+    if not q:
         return False
-    return _lily_wants_price(q) or any(w in q for w in _LILY_ADV_EXTRA)
+    if _lily_wants_price(q) or any(w in q for w in _LILY_ADV_EXTRA):
+        return True
+    if any(w in q for w in _LILY_ADV_SKIP) or q.strip("!?. ") in _LILY_ADV_GREET:
+        return False
+    return True
 
 
 def _lily_adv_zones(analysis, price):
@@ -20883,8 +20894,8 @@ def _lily_adv_scenarios(analysis, price, atr, below, above):
         sl = lo - 0.35 * atr
         risk = entry - sl
         tp1, tp2 = entry + 1.5 * risk, entry + 2.5 * risk
-        if above and above[0][2] > tp1:
-            tp1 = min(above[0][2], tp2 - 0.2 * risk) if above[0][2] < tp2 else tp1
+        if above and entry + risk < above[0][2] < tp2:        # a supply zone before TP2 is the realistic first target
+            tp1 = above[0][2]
         out.append(f"BUY scenario (conditional): wait price to reach demand {model}@{tf} {f(lo)}-{f(hi)} "
                    f"({dist:.{dec}f} away = {dist / atr:.1f}xATR15). Entry {f(entry)} | SL {f(sl)} | TP1 {f(tp1)} | TP2 {f(tp2)} "
                    f"| RR1 {(tp1 - entry) / risk:.1f}. Trigger: M5/M15 bullish MSS/BOS or sweep+reclaim INSIDE the zone; no trigger = no trade.")
@@ -20894,8 +20905,8 @@ def _lily_adv_scenarios(analysis, price, atr, below, above):
         sl = hi + 0.35 * atr
         risk = sl - entry
         tp1, tp2 = entry - 1.5 * risk, entry - 2.5 * risk
-        if below and below[0][3] < tp1:
-            tp1 = max(below[0][3], tp2 + 0.2 * risk) if below[0][3] > tp2 else tp1
+        if below and tp2 < below[0][3] < entry - risk:
+            tp1 = below[0][3]
         out.append(f"SELL scenario (conditional): wait price to reach supply {model}@{tf} {f(lo)}-{f(hi)} "
                    f"({dist:.{dec}f} away = {dist / atr:.1f}xATR15). Entry {f(entry)} | SL {f(sl)} | TP1 {f(tp1)} | TP2 {f(tp2)} "
                    f"| RR1 {(entry - tp1) / risk:.1f}. Trigger: M5/M15 bearish MSS/BOS or sweep+reject INSIDE the zone; no trigger = no trade.")
@@ -20914,7 +20925,11 @@ def _lily_advisor_brief(chat_id):
     f = lambda v: "—" if v is None else f"{float(v):.{dec}f}"
     price = float(snap["price"])
     frames = a.get("frames") or {}
-    lines = [f"Live XAUUSD = {f(price)} · source = {snap.get('source')} · age {int(snap.get('age_s') or 0)}s · "
+    _e = _TWELVE_LAST_ERR.get(LILY_SYMBOL)
+    feeds = ("Data feeds: Twelve key=" + ("present" if _twelve_has_key() else "MISSING")
+             + (f", last Twelve problem: {_e[1]}" if _e and time.time() - _e[0] < 900 else ", Twelve OK")
+             + "; Deriv live=" + ("ON" if _deriv_quote(LILY_SYMBOL) else "silent") + "; Yahoo=backup")
+    lines = [feeds, f"Live XAUUSD = {f(price)} · source = {snap.get('source')} · age {int(snap.get('age_s') or 0)}s · "
              f"{datetime.now(_LILY_TZ).strftime('%H:%M')} Cambodia time"
              + (f" · NOTE: {snap.get('quote_error')}" if snap.get("quote_error") else "")]
     try:
@@ -20950,12 +20965,16 @@ def _lily_advisor_brief(chat_id):
         lines += _lily_adv_scenarios(a, price, atr, below, above)
     else:
         lines.append("Candle analysis unavailable this moment; only the live price is verified.")
-    for fn, label in ((lambda: _lily_micro_prompt_text(_lily_micro_analysis()), "micro"),
-                      (lambda: _lily_intel_prompt_text(_lily_intelligence_analysis()), "intel")):
-        try:
-            lines.append(fn())
-        except Exception as exc:
-            print("Lily advisor", label, type(exc).__name__)
+    try:                                              # both engines return (result, error)
+        _i, _ierr = _lily_intelligence_analysis(force=False)
+        if _i:
+            lines.append(_lily_intel_prompt_text(_i))
+            lines.append(_lily_micro_prompt_text(_i["micro"]))
+        else:
+            _m, _merr = _lily_micro_analysis(force=False)
+            lines.append(_lily_micro_prompt_text(_m) if _m else f"Intelligence/Micro unavailable ({_ierr or _merr}); do not guess them.")
+    except Exception as exc:
+        print("Lily advisor micro/intel:", type(exc).__name__, exc)
     try:
         events, _e = news_for_symbol(LILY_SYMBOL, hours_ahead=12, hours_back=1)
         if events:
@@ -20977,6 +20996,8 @@ _LILY_ADV_RULES = """
 
 === LILY ADVISOR MODE (overrides any earlier rule about asking for the price or refusing levels) ===
 You are កញ្ញាលីលី, the user's personal senior XAUUSD trading advisor. You READ THE MARKET YOURSELF from the MARKET BRIEF.
+- The MARKET BRIEF below IS the "BOT LIVE SNAPSHOT": it is always supplied, live, in this very chat. Never say you have no data/snapshot, never tell the user to run /analyze, /scan or /intel first, and never say "I cannot analyse the gold market" when the brief has data.
+- If the user asks whether Twelve Data / a feed is on, answer from the "Data feeds" line of the brief.
 - NEVER ask the user for the current price, time or chart. The brief already has them. Ignore any rule that tells you to ask for a price.
 - Give SPECIFIC numbers, but ONLY numbers that appear in the brief (live price, zones, Entry, SL, TP1, TP2, RR, invalidation). Never invent or round a level that is not there.
 - If the ENGINE PLAN is CONFIRMED: present it as the actionable plan. If it is NOT confirmed or only a conditional scenario exists: give the exact levels as "conditional" and say exactly what must happen first (trigger) and what cancels it.
@@ -21040,6 +21061,260 @@ BUILD_VERSION = "V27.4 LILY FULL ADVISOR · DERIV LIVE · 5 SCANS/MIN"
 BUILD_LOG = [("V27.4", "Miss Lily reads the market herself (no price questions): Python MARKET BRIEF with session, H4-M1 structure, "
                        "zones, exact Entry/SL/TP and conditional scenarios, micro + fused intelligence, news, daily target; AI only advises "
                        "from it. Analyze worker parallelism raised so 5 scans/min hold; Instant + Analyze alerts go to their Group topics")] + BUILD_LOG
+
+
+_V275_PREV_CHAT_HELP = chat_help_text
+def chat_help_text():
+    txt = _V275_PREV_CHAT_HELP()
+    txt = txt.replace("Bot សួរតម្លៃអ្នក រួចវិភាគ", "Lily ទាញ Live Data ដោយស្វ័យប្រវត្តិ")
+    txt = txt.replace("តម្លៃអ្នកជា <b>តម្លៃពិត</b>។ Candle = Yahoo (យឺត) + Candle និមិត្តភ្ជាប់ទៅតម្លៃអ្នក។ មិនប្រើ Twelve Data ទេ។",
+                      "Lily ប្រើ Twelve Data ជាប្រភពដំបូង និង Deriv/Yahoo ជា Backup នៅពេល API មិនអាចប្រើបាន។")
+    return txt
+
+
+
+# =============================================================================
+# V27.5 · LILY DEEP PYTHON MARKET READER + TWELVE-FIRST 24/7 ACCESS
+# - Keeps Twelve Data as Lily's first-choice quote/candle provider whenever the
+#   API key, market session and plan credits permit; existing Deriv/Yahoo backup
+#   remains available when Twelve is closed, limited or unreachable.
+# - Micro M1/M5 candle analysis is now Twelve-first too.
+# - Adds a detailed Python-only evidence brief: MTF structure, liquidity,
+#   sweeps, displacement, FVG/OB/OTE, candle patterns, ATR regime, volume
+#   profile (only when genuine volume exists), zones, and conditional plans.
+# - Never requests a manually typed market price. Python remains the sole
+#   authority for numeric levels; AI only explains the calculated evidence.
+# =============================================================================
+
+_LILY_V275_PREV_BRIEF = _lily_advisor_brief
+
+
+def _lily_adv_num(value, decimals=None):
+    try:
+        if value is None:
+            return "—"
+        d = SYMBOLS_MAP[LILY_SYMBOL]["decimals"] if decimals is None else int(decimals)
+        return f"{float(value):.{d}f}"
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+
+
+def _lily_deep_frame_lines(tf, fr, price):
+    """Render only deterministic Python evidence for one timeframe."""
+    if not isinstance(fr, dict):
+        return []
+    dec = SYMBOLS_MAP[LILY_SYMBOL]["decimals"]
+    f = lambda x: _lily_adv_num(x, dec)
+    st = fr.get("structure") or {}
+    liq = fr.get("liquidity") or {}
+    pdx = fr.get("pd") or {}
+    lines = [
+        f"{tf}: bias={fr.get('bias')} event={fr.get('event')} EMA={fr.get('ema_trend')} "
+        f"PD={pdx.get('zone')} ATR={f(fr.get('atr'))} feed={_SRC.get((LILY_SYMBOL, tf), 'unknown')} "
+        f"candle={fr.get('last_closed')}"
+    ]
+    if st.get("protected_low") is not None or st.get("protected_high") is not None:
+        lines.append(f"  Protected structure: low={f(st.get('protected_low'))} high={f(st.get('protected_high'))}")
+    if st.get("swing_low") is not None or st.get("swing_high") is not None:
+        lines.append(f"  Swing range: {f(st.get('swing_low'))}–{f(st.get('swing_high'))}")
+    lines.append(
+        f"  Liquidity: sweep={liq.get('sweep')} BSL={f(liq.get('bsl'))} SSL={f(liq.get('ssl'))} "
+        f"EQH={bool(liq.get('equal_highs'))} EQL={bool(liq.get('equal_lows'))}"
+    )
+    lines.append(
+        f"  Delivery: displacement={fr.get('displacement')} turtle_soup={fr.get('turtle_soup')} "
+        f"inducement={fr.get('inducement')} draw={fr.get('draw_on_liquidity')}"
+    )
+    ote = fr.get("ote")
+    if ote:
+        lines.append(f"  OTE {ote.get('direction')}: {f(ote.get('low'))}–{f(ote.get('high'))} (context only)")
+    nearest = fr.get("nearest_zone")
+    if nearest:
+        lines.append(f"  Nearest valid zone: {nearest.model} {nearest.direction} {f(nearest.low)}–{f(nearest.high)} "
+                     f"CE={f(fr.get('ce'))}; distance={abs(float(nearest.mid)-price):.{dec}f}")
+    else:
+        lines.append("  Nearest valid zone: none")
+    return lines
+
+
+def _lily_advisor_brief(chat_id):
+    snap, err = _lily_market_snapshot(force=False)
+    head = f"\n\n=== LILY DEEP MARKET BRIEF · {LILY_SYMBOL} · PYTHON EVIDENCE ===\n"
+    if not snap:
+        return head + (
+            f"NO VERIFIED LIVE DATA ({err}). Do not output guessed prices or levels. "
+            "Do not ask the user to type a price. Explain that the feed is unavailable and wait for recovery."
+        )
+
+    a = snap.get("analysis") or {}
+    p = snap.get("plan") or {}
+    dec = SYMBOLS_MAP[LILY_SYMBOL]["decimals"]
+    f = lambda x: _lily_adv_num(x, dec)
+    price = float(snap.get("price"))
+    as_of = float(snap.get("as_of") or time.time())
+    quote_age = max(0.0, time.time() - as_of)
+    frames = a.get("frames") or {}
+
+    lines = [
+        f"DATA: primary Twelve Data is {'configured' if _twelve_has_key() else 'NOT CONFIGURED'}; "
+        f"selected quote source={snap.get('source')}; quote age={int(quote_age)}s; "
+        f"fallback/delayed={bool(snap.get('delayed'))}; Cambodia time={datetime.now(_LILY_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+        f"CURRENT {LILY_SYMBOL}={f(price)} · quote timestamp={datetime.fromtimestamp(as_of, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+    ]
+
+    try:
+        se = session_info(LILY_SYMBOL)
+        lines.append(f"SESSION: {se.get('name')} · market quality={se.get('quality')} · killzone={se.get('kill')} · {se.get('note')}")
+    except Exception as exc:
+        lines.append(f"SESSION: unavailable ({type(exc).__name__})")
+
+    if not a or not frames:
+        lines.append("ICT candle analysis unavailable; quote only. Do not invent candle structure.")
+    else:
+        direction = a.get("direction", "WAIT")
+        lines.append(
+            f"TOP-DOWN VERDICT: bias={a.get('bias')} direction={direction} score={a.get('score')}/100 "
+            f"status={a.get('status')} alignment={a.get('alignment')}"
+        )
+        votes = {"BULLISH": 0, "BEARISH": 0, "NEUTRAL": 0}
+        for tf, fr in frames.items():
+            if fr:
+                votes[fr.get("bias", "NEUTRAL")] = votes.get(fr.get("bias", "NEUTRAL"), 0) + 1
+        lines.append(f"MTF vote count (available TFs only): {votes}")
+        lines.append("TIMEFRAME EVIDENCE (higher timeframe context → lower timeframe execution):")
+        for tf in ("H4", "H2", "H1", "M30", "M15", "M5", "M1"):
+            fr = frames.get(tf)
+            if fr:
+                lines.extend(_lily_deep_frame_lines(tf, fr, price))
+
+        # Pattern engine: candle, classical structure, ICT/SMC and advanced patterns.
+        pattern_tf = frames.get("M15") or frames.get("M5") or frames.get("H1")
+        candles = getattr(pattern_tf, "_candles", None) if pattern_tf else None
+        # The timeframe result stores evidence, while candle objects are fetched
+        # from the same Twelve-first provider for a compact independent pattern read.
+        if candles is None:
+            try:
+                with _twelve_primary_scope(True), _feature_data_access(allow_twelve=True, anchor=False):
+                    _cur, _prev, _cs, _n = fetch_data(LILY_SYMBOL, "M15", force=False, allow_twelve=True)
+                candles = _cs
+            except Exception:
+                candles = None
+        if candles:
+            try:
+                detected, bull, bear, pbias = analyze_patterns(candles, lookback=24)
+                names = []
+                for item in detected[-12:]:
+                    name = item.get("name") if isinstance(item, dict) else str(item)
+                    if name and name not in names:
+                        names.append(name)
+                lines.append(f"PATTERN ENGINE M15: bias={pbias} bull_weight={bull} bear_weight={bear}; "
+                             f"patterns={', '.join(names) if names else 'none detected'}")
+                atrp = calc_atr(candles, 14)
+                read = _v21_candle_read(candles[:-1] if len(candles) > 1 else candles, atrp)
+                lines.append(f"LAST CLOSED CANDLE: {read.get('pattern')} bias={read.get('bias')} "
+                             f"quality={read.get('quality')} facts={'; '.join(read.get('facts') or [])}")
+                regime, ratio = _atr_regime(candles[:-1] if len(candles) > 1 else candles)
+                lines.append(f"VOLATILITY REGIME M15: {regime} · ATR ratio={ratio}")
+                vp = _volume_profile(candles)
+                if vp:
+                    lines.append(f"VOLUME PROFILE (OHLCV approximation; {vp.get('coverage')} candles): "
+                                 f"POC={f(vp.get('poc'))} VAH={f(vp.get('vah'))} VAL={f(vp.get('val'))} "
+                                 f"HVN={','.join(f(x) for x in vp.get('hvn', []))} "
+                                 f"LVN={','.join(f(x) for x in vp.get('lvn', []))}")
+                else:
+                    lines.append("VOLUME PROFILE: unavailable (insufficient genuine candle volume; do not fabricate)")
+            except Exception as exc:
+                lines.append(f"PATTERN/VOLUME ANALYSIS unavailable ({type(exc).__name__})")
+
+        fr15 = frames.get("M15") or frames.get("M5") or {}
+        atr = float(fr15.get("atr") or 0)
+        below, above = _lily_adv_zones(a, price)
+        lines.append(f"ENTRY VOLATILITY REFERENCE: ATR15={f(atr)}")
+        if below:
+            lines.append("DEMAND ZONES BELOW PRICE (nearest first): " + "; ".join(
+                f"{model}@{tf} {f(lo)}–{f(hi)} distance={f(dist)} ({dist / atr:.2f} ATR)"
+                if atr > 0 else f"{model}@{tf} {f(lo)}–{f(hi)} distance={f(dist)}"
+                for tf, model, lo, hi, dist in below))
+        else:
+            lines.append("DEMAND ZONES BELOW PRICE: none validated")
+        if above:
+            lines.append("SUPPLY ZONES ABOVE PRICE (nearest first): " + "; ".join(
+                f"{model}@{tf} {f(lo)}–{f(hi)} distance={f(dist)} ({dist / atr:.2f} ATR)"
+                if atr > 0 else f"{model}@{tf} {f(lo)}–{f(hi)} distance={f(dist)}"
+                for tf, model, lo, hi, dist in above))
+        else:
+            lines.append("SUPPLY ZONES ABOVE PRICE: none validated")
+
+        if p:
+            rr = (p.get("rr") or [None])[0]
+            confirmed = _lily_setup_confirmed(snap)
+            lines.append(
+                f"ENGINE SETUP: {'CONFIRMED' if confirmed else 'NOT CONFIRMED'} · {direction} "
+                f"entry={f(p.get('entry'))} SL={f(p.get('sl'))} TP1={f(p.get('tp1'))} "
+                f"TP2={f(p.get('tp2'))} RR1={rr} zone={p.get('zone')}@{p.get('zone_tf')} "
+                f"zone_bounds={f(p.get('zone_low'))}–{f(p.get('zone_high'))}"
+            )
+        else:
+            lines.append("ENGINE SETUP: none qualified; do not force a trade")
+        lines.extend(_lily_adv_scenarios(a, price, atr, below, above))
+
+    # Independent fusion + micro timing. These are corroboration, not replacements
+    # for the primary ICT candle evidence.
+    try:
+        intel, ierr = _lily_intelligence_analysis(force=False)
+        if intel:
+            lines.append("FUSED INTELLIGENCE: " + _lily_intel_prompt_text(intel))
+            lines.append("MICROSTRUCTURE: " + _lily_micro_prompt_text(intel.get("micro") or {}))
+        else:
+            micro, merr = _lily_micro_analysis(force=False)
+            lines.append("MICROSTRUCTURE: " + (_lily_micro_prompt_text(micro) if micro else
+                          f"unavailable ({ierr or merr}); do not infer confirmation"))
+    except Exception as exc:
+        lines.append(f"FUSED/MICRO analysis unavailable ({type(exc).__name__})")
+
+    try:
+        events, _e = news_for_symbol(LILY_SYMBOL, hours_ahead=12, hours_back=1)
+        if events:
+            danger, _ev = news_risk_state(events)
+            lines.append("ECONOMIC NEWS next 12h: " + "; ".join(
+                f"{e.get('title')} ({e.get('cur')}, {e.get('impact')})" for e in events[:5]) +
+                (" · HIGH-RISK NEWS WINDOW ACTIVE" if danger else ""))
+        else:
+            lines.append("ECONOMIC NEWS next 12h: no High/Medium release found by current calendar feed")
+    except Exception as exc:
+        lines.append(f"ECONOMIC NEWS unavailable ({type(exc).__name__})")
+    try:
+        lines.append("DAILY TARGET/PNL: " + re.sub(r"<[^>]+>", "", _lily_goal_status_text(chat_id)).replace("\n", " ")[:220])
+    except Exception:
+        pass
+
+    lines.append(
+        "DECISION RULE: choose BUY/SELL only when HTF context, M15/M5 structure, liquidity/zone location "
+        "and a closed-candle LTF trigger agree. Otherwise WAIT. A sweep alone is not reversal; OTE alone is not entry; "
+        "unverified volume is not evidence. Levels above are Python-derived only."
+    )
+    return head + "\n".join(lines)
+
+
+_LILY_ADV_RULES = """
+=== LILY DEEP ADVISOR MODE ===
+You are កញ្ញាលីលី, a disciplined institutional-style market advisor.
+- The Python MARKET BRIEF is the sole numerical source of truth. Never ask the user for a current price or request a screenshot to begin a market read.
+- Analyze H4/H2/H1 context first, then M30/M15 structure, then M5/M1 execution. Explicitly discuss disagreements.
+- Explain market regime, HH/HL or LH/LL, BOS/MSS/CHOCH, BSL/SSL, EQH/EQL, sweep/reclaim, displacement, FVG/OB validity, premium/discount, OTE, candle pattern, volatility and volume profile only when supplied.
+- Distinguish confirmed setup, developing setup, conditional zone and invalidated/no-trade. Never turn a conditional zone into an immediate entry.
+- Give the nearest important BUY demand and SELL supply zones, then specify the trigger, invalidation and realistic opposing-liquidity target.
+- If no valid zone or trigger exists, say WAIT and identify what price/structure event would change the decision.
+- Never claim Twelve Data is available when the brief says backup/unavailable. Quote freshness matters; state if data is stale or market is closed.
+- Respond in Khmer by default, address the user លោកម្ចាស់. Format: decision; HTF→LTF evidence; key zones; conditional entry/SL/TP/RR only if calculated; invalidation; strongest opposing case; confidence and risks.
+- Do not guarantee profit. Never invent numbers, indicators, spreads, news, volume or confirmations.
+"""
+
+
+# Ensure Twelve Data remains the first-choice source for Lily's own M1/M5
+# microstructure path; external background scanners remain unchanged.
+BUILD_VERSION = "V27.5 LILY DEEP PYTHON ADVISOR · TWELVE-FIRST · NO MANUAL PRICE"
+BUILD_LOG = [("V27.5", "Lily deep Python evidence brief: seven-TF ICT/SMC, candle patterns, ATR regime, optional OHLCV profile, fused intelligence and microstructure; Twelve-first M1/M5; no manual-price prompts; Deriv/Yahoo remain explicit fallbacks")] + BUILD_LOG
 
 
 if __name__ == "__main__":
