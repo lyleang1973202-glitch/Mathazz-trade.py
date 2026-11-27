@@ -19417,10 +19417,7 @@ def handle_update(update):
                 if where and where != origin:
                     note += " នឹងផ្ញើលទ្ធផលក្នុង Topic <b>Analyze</b>។"
                 tg("sendMessage", chat_id=chat_id, text=note, parse_mode="HTML")
-                if re.search(r"trading\s?view", txt.lower()) and not (CHARTIMG_ENABLED and CHARTIMG_API_KEY):
-                    tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
-                       text="ℹ️ រូប <b>TradingView</b> ត្រូវការ <code>CHARTIMG_API_KEY</code> (chart-img.com) ក្នុង Railway។ "
-                            "ឥឡូវនេះខ្ញុំផ្ញើតែ Chart ដែលគូសដោយ Python (Zone/Level)។")
+                # V29: TradingView-style chart is drawn natively from Deriv data; no Chart-IMG key needed.
             fake = copy.deepcopy(update)
             fake["message"]["text"] = "/chart " + txt            # reuse the V25.3 /chart pipeline
             return _LYLI_V2534_PREV_HANDLE_UPDATE(fake)
@@ -21901,6 +21898,1198 @@ def _image_details_explainer(symbol, p1, ict, live, chart_last, sync, sync_diff,
 BUILD_VERSION = "V28.5 IMAGE ANALYSIS PRO · MULTI-VISION VERIFY · CONSERVATIVE CONSENSUS"
 BUILD_LOG = [("V28.5", "Image Analysis: retain Gemini full-chart + four micro-crops; optionally cross-check Claude/DeepSeek vision when keys exist; merge only corroborated missing facts; preserve conflicts/uncertainty; never average conflicting prices or let vision reviewers invent trade levels")] + BUILD_LOG
 
-# Start after all V28.5 image-analysis wrappers have been defined.
+
+# =============================================================================
+# V29 · DERIV PRIMARY MARKET DATA + IMAGE ANALYSIS PRO (DERIV-VERIFIED) + LILY TRADINGVIEW-STYLE CHART
+#
+#  1) DERIV = PRIMARY CANDLE + PRICE SOURCE
+#     Before V29 Deriv supplied only a live tick; candles came from Yahoo (shifted onto the Deriv scale).
+#     Now every candle set (M1..H4) is read from Deriv itself (ticks_history, style=candles) over one
+#     persistent WebSocket, cached, refreshed incrementally (last 6 candles) and paced under Deriv's limit.
+#     Order: Deriv -> (Twelve inside Lily/Image scopes, if a key exists) -> Yahoo (labelled backup).
+#     ICT / ICT PRO / Scan Zone scanners keep their V28.2 "Yahoo-only" rule unless DERIV_CANDLES_SCANNERS=1.
+#  2) LILY: market snapshot, advisor brief and /chart all use Deriv data. The chart is drawn in a
+#     TradingView look (dark theme, right price scale, last-price tag + candle countdown, OB/FVG zones,
+#     Long/Short position boxes for Entry/SL/TP, EMA 20/50) from the Deriv candles.
+#  3) ANALYZE PIC (Image Analysis): Deriv is the ground truth. New "Deriv Verification" cross-checks what
+#     the AI read from the screenshot (instrument, last price, price axis, zones, swings/liquidity, trend)
+#     against real Deriv candles and shows a score. Evidence can only LOWER confidence, never raise a signal.
+#     A clean Deriv TradingView-style chart with the Python plan is sent under the result card.
+#  4) /derivfeed (admin) shows link status, request budget, cache and which source each timeframe used.
+# =============================================================================
+import collections as _v29_collections
+
+DERIV_CANDLES_PRIMARY = (os.environ.get("DERIV_CANDLES_PRIMARY") or "1").strip().lower() not in ("0", "false", "no", "off")
+DERIV_CANDLES_SCANNERS = (os.environ.get("DERIV_CANDLES_SCANNERS") or "0").strip().lower() in ("1", "true", "yes", "on")
+DERIV_CANDLES_ALERTS = (os.environ.get("DERIV_CANDLES_ALERTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+DERIV_CANDLES_PER_MIN = max(10, min(55, int(os.environ.get("DERIV_CANDLES_PER_MIN") or 45)))
+DERIV_CANDLES_BG_SHARE = 0.6            # background workers may use at most 60% of the budget; buttons / Lily / Image keep the rest
+DVC_GRAN = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H2": 7200, "H4": 14400}
+DVC_REFRESH_S = {"M1": 6, "M5": 10, "M15": 25, "M30": 50, "H1": 80, "H2": 150, "H4": 210}
+DVC_REQ_TIMEOUT_S = float(os.environ.get("DERIV_CANDLES_TIMEOUT_S") or 10)
+DVC_INTERACTIVE_WAIT_S = 4.0
+LILY_CHARTIMG_REFERENCE = (os.environ.get("LILY_CHARTIMG_REFERENCE") or "0").strip().lower() in ("1", "true", "yes", "on")
+V29_TV_CANDLES = max(60, min(200, int(os.environ.get("LILY_TV_CANDLES") or 110)))
+V29_TV_EMAS = (os.environ.get("LILY_TV_EMAS") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+class _DvcRateLimited(Exception):
+    pass
+
+
+class _DvcApiError(Exception):
+    pass
+
+
+class _DerivCandleClient:
+    """One persistent Deriv WebSocket for candle requests (request/response matched by req_id)."""
+
+    def __init__(self):
+        self.lock = threading.RLock()          # serialises send/recv on the socket
+        self.tlock = threading.Lock()          # protects the request-time deque
+        self.times = _v29_collections.deque()
+        self.ws = None
+        self.url_i = 0
+        self.url = ""
+        self.req_id = 0
+        self.status = "idle"
+        self.fatal = False
+        self.last_err = ""
+        self.last_err_t = 0.0
+        self.last_ok_t = 0.0
+        self.n_ok = 0
+        self.n_err = 0
+        self.fail_streak = 0
+        self.down_until = 0.0
+        self.block_until = 0.0
+        self.latency_ms = None
+        self.api_err_streak = 0
+
+    def _drop(self):
+        try:
+            if self.ws is not None:
+                self.ws.close()
+        except Exception:
+            pass
+        self.ws = None
+        if self.status == "connected":
+            self.status = "down"
+
+    def _connect(self):
+        try:
+            import websocket as _ws
+        except Exception:
+            self.fatal = True
+            self.status = "no-lib"
+            _v273_log_once("v29-nolib", "V29 Deriv candles: python package 'websocket-client' is missing -> add it to requirements.txt "
+                                        "(Deriv candles disabled, Yahoo fallback in use)", 3600)
+            raise RuntimeError("websocket-client missing")
+        last = None
+        n = len(DERIV_WS_URLS)
+        for k in range(n):
+            url = DERIV_WS_URLS[(self.url_i + k) % n]
+            try:
+                self.ws = _ws.create_connection(url, timeout=8, enable_multithread=True)
+                self.url_i = (self.url_i + k) % n
+                self.url = url.split("?")[0]
+                self.status = "connected"
+                return
+            except Exception as exc:
+                last = exc
+        self.status = "down"
+        raise ConnectionError("Deriv socket: " + type(last).__name__ + ": " + str(last)[:80])
+
+    def _budget(self, background):
+        limit = DERIV_CANDLES_PER_MIN * (DERIV_CANDLES_BG_SHARE if background else 1.0)
+        deadline = time.time() + (0.0 if background else DVC_INTERACTIVE_WAIT_S)
+        while True:
+            now = time.time()
+            with self.tlock:
+                while self.times and now - self.times[0] >= 60:
+                    self.times.popleft()
+                if len(self.times) < limit:
+                    self.times.append(now)
+                    return
+            if now >= deadline:
+                raise _DvcRateLimited("Deriv candle budget used (%d/min)" % DERIV_CANDLES_PER_MIN)
+            time.sleep(0.25)
+
+    def per_minute_used(self):
+        now = time.time()
+        with self.tlock:
+            return sum(1 for t in self.times if now - t < 60)
+
+    def request(self, payload, background=False):
+        if self.fatal:
+            raise RuntimeError("websocket-client missing")
+        now = time.time()
+        if now < self.block_until:
+            raise _DvcRateLimited("Deriv RateLimit penalty %ds" % int(self.block_until - now))
+        if now < self.down_until:
+            raise ConnectionError("Deriv candle link cooling down %ds" % int(self.down_until - now))
+        self._budget(background)
+        with self.lock:
+            last = None
+            for attempt in (0, 1):
+                try:
+                    if self.ws is None:
+                        self._connect()
+                    self.req_id += 1
+                    rid = self.req_id
+                    self.ws.settimeout(DVC_REQ_TIMEOUT_S)
+                    t0 = time.time()
+                    self.ws.send(json.dumps(dict(payload, req_id=rid)))
+                    while True:
+                        raw = self.ws.recv()
+                        if not raw:
+                            raise ConnectionError("socket closed")
+                        msg = json.loads(raw)
+                        if msg.get("req_id") == rid:
+                            break
+                        if time.time() - t0 > DVC_REQ_TIMEOUT_S:
+                            raise TimeoutError("no reply")
+                    self.latency_ms = int((time.time() - t0) * 1000)
+                    self.fail_streak = 0
+                    self.last_ok_t = time.time()
+                    self.n_ok += 1
+                    err = msg.get("error")
+                    if err:
+                        code, text = str(err.get("code")), str(err.get("message"))[:140]
+                        if code == "RateLimit":
+                            self.block_until = time.time() + 20
+                        elif code not in ("InvalidSymbol", "MarketIsClosed", "NoRecordsFound"):
+                            self.api_err_streak += 1                      # endpoint may not serve ticks_history -> try the other URL
+                            if self.api_err_streak >= 2 and len(DERIV_WS_URLS) > 1:
+                                self.api_err_streak = 0
+                                self.url_i = (self.url_i + 1) % len(DERIV_WS_URLS)
+                                self._drop()
+                        self.last_err, self.last_err_t = f"{code}: {text}", time.time()
+                        raise _DvcApiError(f"{code}: {text}")
+                    self.api_err_streak = 0
+                    return msg
+                except (_DvcApiError, _DvcRateLimited):
+                    raise
+                except RuntimeError as exc:
+                    if self.fatal:
+                        raise
+                    last = exc
+                    self._drop()
+                except Exception as exc:
+                    last = exc
+                    self._drop()
+            self.n_err += 1
+            self.fail_streak += 1
+            self.last_err = f"{type(last).__name__}: {str(last)[:100]}"
+            self.last_err_t = time.time()
+            if self.fail_streak >= 3:
+                self.down_until = time.time() + 45          # fast-fail to Yahoo instead of 10 s waits per call
+                self.fail_streak = 0
+            raise last if last else ConnectionError("Deriv request failed")
+
+    def candles(self, ds, gran, count, background=False):
+        msg = self.request({"ticks_history": ds, "adjust_start_time": 1, "count": int(count),
+                            "end": "latest", "start": 1, "style": "candles", "granularity": int(gran)}, background)
+        rows = []
+        for c in msg.get("candles") or []:
+            try:
+                rows.append([int(c["epoch"]), float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])])
+            except (KeyError, TypeError, ValueError):
+                continue
+        rows.sort(key=lambda r: r[0])
+        return rows
+
+
+_DVC_CLIENT = _DerivCandleClient()
+_DVC_STORE = {}            # (symbol, tf) -> {"rows": [[epoch,o,h,l,c]...], "t": fetched_at}
+_DVC_KEYLOCKS = {}
+
+
+def _dvc_merge(rows, got):
+    d = {r[0]: r for r in rows}
+    for r in got:
+        d[r[0]] = r
+    return [d[k] for k in sorted(d)]
+
+
+def _dvc_apply_tick(ds, gran, candles, rows):
+    """Move the forming candle to the freshest Deriv tick (stream is already open; never waits)."""
+    try:
+        if not DERIV_LIVE_ALL or not candles:
+            return
+        _DERIV_FEED.ensure(ds)
+        rec = _DERIV_FEED.ticks.get(ds)
+        now = time.time()
+        if not rec or now - rec["t"] > DERIV_MAX_TICK_AGE_S:
+            return
+        if rows[-1][0] != int(now // gran * gran):
+            return                                        # newest candle is not the forming one (closed market / API lag)
+        c0, price = candles[-1], float(rec["price"])
+        if abs(price - c0.close) / max(abs(price), 1e-9) > 0.01:
+            return
+        c = Candle(c0.open, max(c0.high, price), min(c0.low, price), price, c0.ts, None)
+        c.realtime = True
+        candles[-1] = c
+    except Exception as exc:
+        _v273_log_once("v29-tick", "V29 Deriv tick merge: " + type(exc).__name__, 600)
+
+
+def _deriv_candles(symbol, timeframe):
+    """-> (candles oldest-first incl. the forming one, "") or (None, reason). Candle.ts = open time, UTC."""
+    ds = _deriv_symbol(symbol)
+    gran = DVC_GRAN.get(timeframe)
+    if not ds or not gran or timeframe not in ALL_TFS:
+        return None, "Deriv: unsupported symbol/timeframe"
+    target = ALL_TFS[timeframe]["target"] + 1
+    key = (symbol, timeframe)
+    ttl = DVC_REFRESH_S.get(timeframe, 30)
+    lock = _DVC_KEYLOCKS.setdefault(key, threading.Lock())
+    with lock:
+        now = time.time()
+        st = _DVC_STORE.get(key)
+        if not (st and now - st["t"] < ttl):
+            try:
+                bg = _v28_alert_ctx()
+                rows = None
+                if st and len(st["rows"]) >= int(target * 0.8):
+                    got = _DVC_CLIENT.candles(ds, gran, 6, bg)
+                    if got and got[0][0] <= st["rows"][-1][0] + gran:        # contiguous -> cheap incremental refresh
+                        rows = _dvc_merge(st["rows"], got)
+                if rows is None:
+                    rows = _DVC_CLIENT.candles(ds, gran, target, bg)
+                if not rows:
+                    raise ValueError("empty candle list")
+                st = {"rows": rows[-(target + 5):], "t": time.time()}
+                _DVC_STORE[key] = st
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+                if not isinstance(exc, (_DvcRateLimited, ConnectionError)):
+                    _DVC_CLIENT.last_err, _DVC_CLIENT.last_err_t = reason, time.time()
+                if not (st and now - st["t"] < ttl * 3 + 20):
+                    return None, "Deriv: " + reason
+                # else: a slightly stale cache is better than a different price scale
+        rows = st["rows"][-target:]
+    if len(rows) < 2:
+        return None, "Deriv: not enough candles"
+    candles = [Candle(r[1], r[2], r[3], r[4], time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[0])), None) for r in rows]
+    _dvc_apply_tick(ds, gran, candles, rows)
+    return candles, ""
+
+
+def _v29_deriv_wanted(symbol, timeframe):
+    if not DERIV_CANDLES_PRIMARY or symbol not in DERIV_SYMBOL_MAP or timeframe not in DVC_GRAN or _DVC_CLIENT.fatal:
+        return False
+    if _v28_deriv_blocked():
+        return False                                       # ALERT_USE_DERIV=0 isolates alert workers
+    ctx = getattr(_TG_CTX, "v", None) or {}
+    if ctx.get("alert_worker"):
+        if str(ctx.get("worker") or "").lower() in ("scanzone", "ict", "ictpro") and not DERIV_CANDLES_SCANNERS:
+            return False                                   # V28.2/V28.3: ICT + ICT PRO scanners stay Yahoo-only
+        if not DERIV_CANDLES_ALERTS:
+            return False                                   # DERIV_CANDLES_ALERTS=0: every alert worker keeps Yahoo candles
+    return True
+
+
+_V29_PREV_FETCH_REMOTE = _fetch_remote
+
+
+def _fetch_remote(symbol, timeframe, allow_twelve=None):
+    if _v29_deriv_wanted(symbol, timeframe):
+        try:
+            raw, err = _deriv_candles(symbol, timeframe)
+        except Exception as exc:
+            raw, err = None, f"Deriv: {type(exc).__name__}: {str(exc)[:80]}"
+        if raw:
+            raw = _clean_candles(raw)
+            if len(raw) >= 2:
+                _SRC[(symbol, timeframe)] = "Deriv"
+                _LIVE_SRC[(symbol, timeframe)] = "Deriv"
+                closed = raw[:-1]
+                return raw[-1].close, closed[-1].close, closed, len(closed)
+            err = "Deriv: not enough clean candles"
+        _v273_log_once(("v29-dvc", symbol, timeframe), f"V29 Deriv candles {symbol} {timeframe}: {err} -> fallback provider", 300)
+    return _V29_PREV_FETCH_REMOTE(symbol, timeframe, allow_twelve)
+
+
+# ---- live price for buttons: Deriv tick -> Deriv M1 candle -> (old order) ---------------------------------
+_V29_PREV_GET_LIVE_PRICE = get_live_price
+
+
+def get_live_price(symbol, force=False):
+    price, src = _V29_PREV_GET_LIVE_PRICE(symbol, force)
+    if price is not None and str(src).startswith("Deriv"):
+        return price, src
+    try:
+        if _v29_deriv_wanted(symbol, "M1"):
+            candles, _e = _deriv_candles(symbol, "M1")
+            if candles:
+                last_open = _lyli_time_seconds(candles[-1].ts)
+                if last_open and time.time() - (last_open + 60) < 180:
+                    return float(candles[-1].close), "Deriv (M1)"
+    except Exception:
+        pass
+    return price, src
+
+
+# =============================================================================
+# LILY: Deriv-first market snapshot (price + ICT analysis built from Deriv candles)
+# =============================================================================
+_V29_PREV_LILY_SNAPSHOT = _lily_market_snapshot
+
+
+def _lily_market_snapshot(force=False):
+    if not (DERIV_CANDLES_PRIMARY and LILY_SYMBOL in DERIV_SYMBOL_MAP and not _DVC_CLIENT.fatal):
+        return _V29_PREV_LILY_SNAPSHOT(force)
+    now = time.time()
+    with _LILY_SNAPSHOT_LOCK:
+        hit = _LILY_SNAPSHOT_CACHE.get("value")
+        if not force and hit and now - _LILY_SNAPSHOT_CACHE.get("t", 0) < LILY_SNAPSHOT_CACHE_S \
+                and str(hit.get("source", "")).startswith("Deriv"):
+            return hit, ""
+    try:
+        with _twelve_primary_scope(False), _feature_data_access(allow_twelve=False, anchor=False):
+            tick = _deriv_quote(LILY_SYMBOL)
+            analysis = build_ict_analysis(LILY_SYMBOL, force=bool(force))
+        ok = isinstance(analysis, dict) and not analysis.get("error") and analysis.get("status") != "DATA INSUFFICIENT"
+        if ok and _SRC.get((LILY_SYMBOL, "M5")) == "Deriv":
+            price = float(tick["price"]) if tick else _safe_num(analysis.get("price"))
+            if price and price > 0:
+                age = 0.0
+                if not tick:
+                    try:
+                        m1 = fetch_data(LILY_SYMBOL, "M1", allow_twelve=False)
+                        lo = _lyli_time_seconds(m1[2][-1].ts) if m1 and m1[2] else None
+                        age = max(0.0, time.time() - (lo + 60)) if lo else 0.0
+                    except Exception:
+                        age = 0.0
+                snap = {"symbol": LILY_SYMBOL, "price": price,
+                        "source": "Deriv spot + Deriv candles" if tick else "Deriv candles (spot tick quiet)",
+                        "as_of": tick["t"] if tick else time.time() - age, "age_s": age,
+                        "analysis": analysis, "plan": analysis.get("plan"),
+                        "delayed": bool(not tick and age > 180 and _gold_open())}
+                with _LILY_SNAPSHOT_LOCK:
+                    _LILY_SNAPSHOT_CACHE.update(t=time.time(), value=snap)
+                return snap, ""
+    except Exception as exc:
+        _v273_log_once("v29-lily-snap", "V29 Lily Deriv snapshot: " + type(exc).__name__ + " " + str(exc)[:100], 300)
+    return _V29_PREV_LILY_SNAPSHOT(force)          # Twelve /price -> Deriv spot + Yahoo -> Yahoo backup (as before)
+
+
+# =============================================================================
+# TRADINGVIEW-STYLE CHART (matplotlib) drawn from Deriv candles
+# =============================================================================
+_V29_TV = {"bg": "#131722", "grid": "#2a2e39", "text": "#d1d4dc", "mute": "#787b86", "up": "#26a69a",
+           "dn": "#ef5350", "blue": "#2962ff", "orange": "#ff9800", "zone_buy": "#26a69a", "zone_sell": "#ef5350"}
+_V29_TF_LABEL = {"M1": "1", "M5": "5", "M15": "15", "M30": "30", "H1": "1H", "H2": "2H", "H4": "4H"}
+
+
+def _v29_ema(values, period):
+    k, e, out = 2.0 / (period + 1), None, []
+    for v in values:
+        e = v if e is None else v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def _v29_clean_old_charts(out_dir, keep_s=6 * 3600):
+    try:
+        now = time.time()
+        for name in os.listdir(out_dir):
+            if name.startswith("lyli_tv_") and name.endswith(".png"):
+                p = os.path.join(out_dir, name)
+                if now - os.path.getmtime(p) > keep_s:
+                    os.remove(p)
+    except Exception:
+        pass
+
+
+_V29_PLT_LOCK = threading.Lock()                 # pyplot keeps global state: one chart at a time
+
+
+def _v29_tv_render(*args, **kwargs):
+    with _V29_PLT_LOCK:
+        return _v29_tv_render_locked(*args, **kwargs)
+
+
+def _v29_tv_render_locked(symbol, timeframe, candles, source="Deriv", live_price=None, plan=None,
+                          zones=None, levels=None, footer="", path=None, max_candles=None):
+    """Draw a TradingView-look chart. zones: [{name,direction BUY|SELL,low,high,index}] (index relative to the visible window).
+    levels: [{name,price,color?}]. plan: {entry,sl,tp1,tp2,tp3}. Returns the PNG path."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    import numpy as np
+    C = _V29_TV
+    allc = list(candles)
+    n = min(len(allc), max_candles or V29_TV_CANDLES)
+    if n < 20:
+        raise ValueError("Not enough candles to draw chart")
+    cs = allc[-n:]
+    dec = SYMBOLS_MAP.get(symbol, {}).get("decimals", 2)
+    ff = lambda v: f"{float(v):,.{dec}f}"
+    o = np.array([float(c.open) for c in cs]); h = np.array([float(c.high) for c in cs])
+    l = np.array([float(c.low) for c in cs]); cl = np.array([float(c.close) for c in cs])
+    ep = [(_lyli_time_seconds(c.ts) or 0) for c in cs]
+    x = np.arange(n)
+    up = cl >= o
+    rng = float(h.max() - l.min()) or 1.0
+    right_pad = 16
+    fig = plt.figure(figsize=(14, 7.8), dpi=140, facecolor=C["bg"])
+    ax = fig.add_axes([0.012, 0.085, 0.903, 0.80])
+    ax.set_facecolor(C["bg"])
+    col = [C["up"] if u else C["dn"] for u in up]
+    ax.vlines(x, l, h, colors=col, linewidth=1.0, zorder=3)
+    ax.bar(x, np.maximum(np.abs(cl - o), rng * 0.0012), bottom=np.minimum(o, cl), width=0.72,
+           color=col, edgecolor=col, linewidth=0.5, zorder=4)
+    ema_txt = []
+    if V29_TV_EMAS and len(allc) >= 30:
+        closes = [float(c.close) for c in allc]
+        for period, color in ((20, C["orange"]), (50, C["blue"])):
+            e = _v29_ema(closes, period)[-n:]
+            ax.plot(x, e, color=color, linewidth=1.0, alpha=0.9, zorder=2)
+            ema_txt.append((f"EMA {period}  {ff(e[-1])}", color))
+    # ---- y range (candles + plan levels that are reasonably close)
+    ymin, ymax = float(l.min()), float(h.max())
+    span = ymax - ymin
+    plan = plan if isinstance(plan, dict) else {}
+    pvals = {k: float(plan[k]) for k in ("entry", "sl", "tp1", "tp2", "tp3")
+             if isinstance(plan.get(k), (int, float)) and math.isfinite(float(plan[k]))}
+    for v in pvals.values():
+        if ymin - 0.6 * span <= v <= ymax + 0.6 * span:
+            ymin, ymax = min(ymin, v), max(ymax, v)
+    pad = (ymax - ymin) * 0.07
+    ymin, ymax = ymin - pad, ymax + pad
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlim(-1.5, n + right_pad)
+    tags = []                                                  # (y, text, fg, bg)
+    # ---- zones
+    live = float(live_price) if live_price is not None else float(cl[-1])
+    zs = [z for z in (zones or []) if isinstance(z, dict) and z.get("high") is not None and z.get("low") is not None
+          and float(z["high"]) >= ymin and float(z["low"]) <= ymax]
+    zs.sort(key=lambda z: abs((float(z["low"]) + float(z["high"])) / 2 - live))
+    label_spots = []
+    for z in zs[:7]:
+        zlo, zhi = float(z["low"]), float(z["high"])
+        zc = C["zone_buy"] if str(z.get("direction")) == "BUY" else C["zone_sell"]
+        x0 = max(0, min(n - 1, int(z.get("index", n // 2))))
+        ax.add_patch(Rectangle((x0 - 0.5, zlo), n + right_pad * 0.55 - x0 + 0.5, max(zhi - zlo, rng * 0.0008),
+                               facecolor=zc, alpha=0.13, edgecolor=zc, linewidth=0.7, zorder=1))
+        lx = min(x0, max(0, n - 16))
+        if all(abs(lx - ox) > 22 or abs(zhi - oy) > span * 0.035 for ox, oy in label_spots):
+            label_spots.append((lx, zhi))
+            ax.text(lx, zhi, " " + str(z.get("name", "")), color=zc, fontsize=7.6, va="bottom", ha="left",
+                    alpha=0.95, zorder=5)
+    # ---- reference levels
+    for lv in (levels or []):
+        try:
+            p = float(lv["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (ymin <= p <= ymax):
+            continue
+        lc = lv.get("color") or C["mute"]
+        ax.axhline(p, color=lc, linewidth=0.8, linestyle=(0, (4, 4)), alpha=0.75, zorder=2)
+        tags.append((p, str(lv.get("name", "")), "white", lc))
+    # ---- Long / Short position boxes (TradingView position tool look)
+    if "entry" in pvals and "sl" in pvals:
+        e, s = pvals["entry"], pvals["sl"]
+        tps = [pvals[k] for k in ("tp1", "tp2", "tp3") if k in pvals]
+        xs, xw = n - 1, right_pad - 3
+        ax.add_patch(Rectangle((xs, min(e, s)), xw, abs(e - s), facecolor=C["dn"], alpha=0.20, linewidth=0, zorder=1))
+        if tps:
+            far = max(tps, key=lambda v: abs(v - e))
+            ax.add_patch(Rectangle((xs, min(e, far)), xw, abs(far - e), facecolor=C["up"], alpha=0.16, linewidth=0, zorder=1))
+        ax.hlines(e, xs, xs + xw, colors=C["blue"], linewidth=1.5, zorder=6)
+        ax.hlines(s, xs, xs + xw, colors=C["dn"], linewidth=1.2, linestyles="--", zorder=6)
+        tags.append((e, "ENTRY " + ff(e), "white", C["blue"]))
+        tags.append((s, "SL " + ff(s), "white", C["dn"]))
+        for i, k in enumerate(("tp1", "tp2", "tp3"), 1):
+            if k in pvals:
+                ax.hlines(pvals[k], xs, xs + xw, colors=C["up"], linewidth=1.1, linestyles="--" if i == 1 else ":", zorder=6)
+                tags.append((pvals[k], f"TP{i} " + ff(pvals[k]), "white", C["up"]))
+        risk = abs(e - s)
+        if risk > 0 and tps:
+            ax.text(xs + xw - 0.3, (e + tps[0]) / 2, f"RR 1:{abs(tps[0] - e) / risk:.1f} ", color=C["up"], fontsize=8.5,
+                    fontweight="bold", va="center", ha="right", zorder=7)
+    # ---- last price line + tag (+ candle countdown like TradingView)
+    lc = C["up"] if cl[-1] >= o[-1] else C["dn"]
+    ax.axhline(live, color=lc, linewidth=0.8, linestyle=(0, (2, 2)), alpha=0.8, zorder=2)
+    tf_sec = RT_TF_SEC.get(timeframe, 900)
+    tag_txt = ff(live)
+    if ep[-1] and 0 <= time.time() - ep[-1] < tf_sec:
+        left = int(tf_sec - (time.time() - ep[-1]))
+        tag_txt += f"\n{left // 60:02d}:{left % 60:02d}" if left < 3600 else f"\n{left // 3600}h{(left % 3600) // 60:02d}"
+    tags.append((live, tag_txt, "white", lc))
+    # ---- right-axis tags with simple collision avoidance
+    sep = (ymax - ymin) * 0.03
+    placed, last_y = [], None
+    for y, txt, fg, bg in sorted(tags, key=lambda t: t[0]):
+        yy = y if last_y is None or y - last_y >= sep else last_y + sep
+        last_y = yy
+        placed.append((yy, txt, fg, bg))
+    for yy, txt, fg, bg in placed:
+        ax.text(1.002, yy, " " + txt.replace("\n", " \n ") + " ", transform=ax.get_yaxis_transform(), ha="left", va="center",
+                fontsize=8.4, color=fg, fontweight="bold", clip_on=False, zorder=10,
+                bbox=dict(boxstyle="square,pad=0.25", fc=bg, ec="none"))
+    # ---- axes styling
+    try:
+        yt = [t for t in ax.get_yticks() if ymin <= t <= ymax and all(abs(t - yy) > sep * 0.9 for yy, _t, _f, _b in placed)]
+        ax.set_yticks(yt)
+    except Exception:
+        pass
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y", colors=C["text"], labelsize=9, length=0, pad=8)
+    ax.tick_params(axis="x", colors=C["mute"], labelsize=8.5, length=0, pad=6)
+    for sp in ("top", "left"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("bottom", "right"):
+        ax.spines[sp].set_color(C["grid"])
+    ax.grid(True, color=C["grid"], linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+    step = max(1, n // 8)
+    ticks, labels, prev = [], [], None
+    for i in range(0, n, step):
+        if not ep[i]:
+            continue
+        g = time.gmtime(ep[i])
+        newday = prev is None or g.tm_yday != time.gmtime(ep[prev]).tm_yday
+        labels.append(time.strftime("%d %b", g) if (newday or timeframe in ("H2", "H4")) else time.strftime("%H:%M", g))
+        ticks.append(i)
+        prev = i
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
+    ax.text(0.5, 0.5, f"{symbol}, {_V29_TF_LABEL.get(timeframe, timeframe)}", transform=ax.transAxes, ha="center", va="center",
+            fontsize=58, color="white", alpha=0.035, fontweight="bold", zorder=0)
+    # ---- header (TradingView legend)
+    chg = cl[-1] - o[-1]
+    hc = C["up"] if chg >= 0 else C["dn"]
+    fig.text(0.014, 0.955, f"{symbol}  ·  {_V29_TF_LABEL.get(timeframe, timeframe)}  ·  {source}", color=C["text"],
+             fontsize=13, fontweight="bold", va="center")
+    fig.text(0.014, 0.918, f"O {ff(o[-1])}   H {ff(h[-1])}   L {ff(l[-1])}   C {ff(cl[-1])}   "
+                           f"{chg:+.{dec}f} ({chg / max(abs(o[-1]), 1e-9) * 100:+.2f}%)", color=hc, fontsize=9.5, va="center")
+    xx = 0.014
+    for txt, color in ema_txt:
+        fig.text(xx, 0.89, txt, color=color, fontsize=8.5, va="center")
+        xx += 0.13
+    fig.text(0.915, 0.955, "LILY", color=C["blue"], fontsize=12, fontweight="bold", ha="right", va="center")
+    fig.text(0.915, 0.925, "Deriv market data" if str(source).startswith("Deriv") else str(source), color=C["mute"],
+             fontsize=8, ha="right", va="center")
+    fig.text(0.014, 0.03, (footer or "Render only · Entry/SL/TP come from the Python engine, not from this drawing") + "  ·  UTC",
+             color=C["mute"], fontsize=7.8, va="center")
+    out_dir = os.environ.get("LYLI_CHART_DIR") or _DB_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    if not path:
+        path = os.path.join(out_dir, f"lyli_tv_{symbol}_{timeframe}_{int(time.time() * 1000)}.png")
+    fig.savefig(path, dpi=140, facecolor=C["bg"])
+    plt.close(fig)
+    _v29_clean_old_charts(out_dir)
+    return path
+
+
+def _v29_day_level_rows(symbol, live=None):
+    rows = []
+    try:
+        palette = {"PDH": "#b39ddb", "PDL": "#b39ddb", "Asia High": "#ffb74d", "Asia Low": "#ffb74d",
+                   "PWH": "#4dd0e1", "PWL": "#4dd0e1"}
+        for k, v in (day_levels(symbol) or {}).items():
+            rows.append({"name": k, "price": float(v), "color": palette.get(k)})
+    except Exception as exc:
+        print("V29 day levels:", type(exc).__name__, exc)
+    return rows
+
+
+_V29_OLD_RENDER_CHART = _lyli_render_chart
+
+
+def _lyli_render_chart(symbol, timeframe, candles, source="Unknown", live_price=None, plan=None):
+    """V29: /chart + Lily chart requests -> TradingView-look PNG from Deriv candles. Old renderer = fallback."""
+    try:
+        cs = list(candles or [])
+        if len(cs) < 20:
+            raise ValueError("Not enough candles to draw chart")
+        vis = cs[-V29_TV_CANDLES:]
+        payload = _lyli_zone_payload(vis, live_price)
+        zones = [{"name": f"{z['name']}", "direction": z["direction"], "low": z["low"], "high": z["high"], "index": z["index"]}
+                 for z in payload.get("zones", [])]
+        levels = [{"name": ("Range High" if "High" in lv["name"] else "Range Low"), "price": lv["price"]}
+                  for lv in payload.get("levels", []) if "Range" in lv["name"]]
+        levels += _v29_day_level_rows(symbol, live_price)
+        path = _v29_tv_render(symbol, timeframe, cs, source, live_price, plan, zones, levels)
+        return path, payload, "PNG"
+    except Exception as exc:
+        traceback.print_exc()
+        print("V29 TradingView-style render failed -> old renderer:", type(exc).__name__, exc)
+        return _V29_OLD_RENDER_CHART(symbol, timeframe, candles, source, live_price, plan)
+
+
+# Chart-IMG (OANDA feed) is no longer a second "TradingView" image by default: its prices are not the Deriv feed.
+_V29_OLD_CHARTIMG = _lyli_chartimg_snapshot
+
+
+def _lyli_chartimg_snapshot(timeframe, drawings=None):
+    if not LILY_CHARTIMG_REFERENCE:
+        return None, "SKIPPED: Deriv TradingView-style chart is primary (set LILY_CHARTIMG_REFERENCE=1 to also send Chart-IMG)"
+    return _V29_OLD_CHARTIMG(timeframe, drawings)
+
+
+_V29_PREV_PROMPT = _chat_system_prompt
+
+
+def _chat_system_prompt(chat_id):
+    base = _V29_PREV_PROMPT(chat_id)
+    cut = "TradingView snapshot is configured only when CHARTIMG_ENABLED=1 and CHARTIMG_API_KEY is present; runtime errors are reported separately.\n"
+    base = base.replace(cut, "").replace("A TradingView reference snapshot (Chart-IMG) is also sent.\n", "")
+    return base + (
+        "\n\n=== V29 MARKET DATA + CHART (authoritative) ===\n"
+        "All market data (live price and candles M1-H4) comes from DERIV first; Yahoo is only a labelled backup. "
+        "When the user asks you to draw a chart or a TradingView chart, the bot draws it in TradingView style from the Deriv candles "
+        "(candles, right price scale, last-price tag, FVG/OB zones, PDH/PDL/Asia levels, EMA 20/50, Long/Short boxes for the Python plan). "
+        "Do NOT say a TradingView API key is needed. Tell the Admin to type /chart XAUUSD M15 (or ask naturally). "
+        "You still cannot draw inside the user's own TradingView account; Entry/SL/TP come only from the Python engine.\n")
+
+
+# =============================================================================
+# ANALYZE PIC (IMAGE ANALYSIS PRO): Deriv-verified
+# =============================================================================
+def _v29_pivots(candles, left=3, right=3, lookback=220):
+    cs = list(candles)[-lookback:]
+    highs, lows = [], []
+    for i in range(left, len(cs) - right):
+        win = cs[i - left:i + right + 1]
+        if cs[i].high >= max(c.high for c in win) and cs[i].high > min(c.high for c in win):
+            highs.append((i, float(cs[i].high)))
+        if cs[i].low <= min(c.low for c in win) and cs[i].low < max(c.low for c in win):
+            lows.append((i, float(cs[i].low)))
+    return highs, lows
+
+
+def _v29_collect_pivots(symbol, ctf, tf_candles, cmap=None):
+    """Pivot highs/lows (price, tolerance) from the chart timeframe + H1 + H4 Deriv candles."""
+    hi, lo = [], []
+    seen = set()
+    for tf, cs in ((ctf, tf_candles),):
+        pass
+    for tf in dict.fromkeys([ctf, "H1", "H4"]):
+        try:
+            cs = (cmap or {}).get(tf) or (tf_candles if tf == ctf and tf_candles else (fetch_data(symbol, tf, allow_twelve=True)[2] or []))
+            if len(cs) < 20:
+                continue
+            atr = calc_atr(cs) or 0.0
+            h_, l_ = _v29_pivots(cs)
+            tol = max(0.35 * atr, abs(cs[-1].close) * 0.0002)
+            hi += [(p, tol, tf) for _, p in h_]
+            lo += [(p, tol, tf) for _, p in l_]
+        except Exception as exc:
+            print("V29 pivots", tf, type(exc).__name__, exc)
+    return hi, lo
+
+
+def _v29_zone_overlap(a_lo, a_hi, b_lo, b_hi):
+    inter = min(a_hi, b_hi) - max(a_lo, b_lo)
+    base = max(min(a_hi - a_lo, b_hi - b_lo), 1e-9)
+    return max(0.0, inter) / base
+
+
+def _v29_verify_image(p1, symbol, ctf, tf_candles, live, atr, dec, sym_status, sync, ict, cmap=None):
+    """Cross-check AI-read screenshot facts with Deriv candles. Never creates trade levels.
+    -> {"score","grade","short","lines","confirmed_zones","comps"}; score None when nothing could be checked."""
+    f = lambda v: fmt(v, dec)
+    comps, lines, confirmed_zones = [], [], []
+    atr = atr or 0.0
+
+    def add(name, weight, s, text):
+        comps.append((name, weight, s, text))
+        mark = "—" if s is None else ("✅" if s >= 0.75 else "⚠️" if s >= 0.4 else "❌")
+        lines.append(f"{mark} {text}")
+
+    # 1) instrument
+    if sym_status == "MATCH":
+        add("instrument", 10, 1.0, "Instrument ត្រូវនឹង Symbol ដែលបានជ្រើស")
+    elif sym_status == "MISMATCH":
+        add("instrument", 10, 0.3, "Instrument ក្នុងរូបខុសពី Symbol ដែលបានជ្រើស (បានប្តូរទៅ Symbol ក្នុងរូប)")
+    else:
+        add("instrument", 10, None, "Instrument: AI មិនអាចអានពីរូប")
+    # 2) last price vs Deriv
+    cl = _safe_num(p1.get("last_price"))
+    if sync == "SYNC":
+        add("price", 30, 1.0, f"តម្លៃក្នុងរូប {f(cl)} ជិតតម្លៃ Deriv {f(live)}" if cl is not None else "តម្លៃក្នុងរូបត្រូវនឹង Deriv")
+    elif sync == "NEAR":
+        add("price", 30, 0.5, f"តម្លៃក្នុងរូប {f(cl)} ខុសពី Deriv {f(live)} បន្តិច (Broker feed ផ្សេង ឬរូបចាស់បន្តិច)")
+    elif sync == "OFF":
+        add("price", 30, 0.0, f"តម្លៃក្នុងរូប {f(cl)} ឆ្ងាយពី Deriv {f(live)} · រូបអាចចាស់ ឬជា Symbol/Feed ផ្សេង")
+    else:
+        add("price", 30, None, "តម្លៃក្នុងរូប: មិនអាចអាន/ប្រៀបធៀប")
+    # 3) price axis contains the live price
+    lo_ax, hi_ax = _safe_num(p1.get("price_axis_min")), _safe_num(p1.get("price_axis_max"))
+    if lo_ax is not None and hi_ax is not None and lo_ax < hi_ax and live is not None:
+        span = hi_ax - lo_ax
+        if lo_ax <= live <= hi_ax:
+            add("axis", 10, 1.0, f"Price axis {f(lo_ax)}–{f(hi_ax)} គ្របដណ្ដប់តម្លៃ Deriv បច្ចុប្បន្ន")
+        elif lo_ax - 0.05 * span <= live <= hi_ax + 0.05 * span:
+            add("axis", 10, 0.5, f"Price axis {f(lo_ax)}–{f(hi_ax)} ស្ទើរគ្របដណ្ដប់តម្លៃ Deriv (ជិតគែម)")
+        else:
+            add("axis", 10, 0.0, f"Price axis {f(lo_ax)}–{f(hi_ax)} មិនគ្របដណ្ដប់តម្លៃ Deriv {f(live)} · ជាប្រវត្តិចាស់?")
+    else:
+        add("axis", 10, None, "Price axis: មិនអាចអានបានគ្រប់គ្រាន់")
+    # pivots + Deriv zones for the remaining checks
+    hi_piv, lo_piv = ([], [])
+    py_zones = []
+    if tf_candles and len(tf_candles) >= 30:
+        hi_piv, lo_piv = _v29_collect_pivots(symbol, ctf, tf_candles, cmap)
+        a_ = atr or calc_atr(tf_candles) or 0.0
+        try:
+            py_zones = list(detect_fvg(tf_candles, a_)) + list(detect_ob(tf_candles, a_))
+        except Exception as exc:
+            print("V29 zone detect:", type(exc).__name__, exc)
+        for fr in (ict.get("frames") or {}).values():
+            py_zones += list((fr or {}).get("zones") or [])
+
+    def near_pivot(price, pivots):
+        return next((tf for p, tol, tf in pivots if abs(p - price) <= tol), None)
+
+    # 4) zones
+    zlist = [z for z in (p1.get("zones") or []) if isinstance(z, dict)
+             and _safe_num(z.get("low")) is not None and _safe_num(z.get("high")) is not None][:6]
+    if zlist and py_zones:
+        ok = 0
+        for z in zlist:
+            zl, zh = sorted((_safe_num(z["low"]), _safe_num(z["high"])))
+            hit = next((pz for pz in py_zones if _v29_zone_overlap(zl, zh, float(pz.low), float(pz.high)) >= 0.3), None)
+            via = f"{hit.model} {f(hit.low)}–{f(hit.high)}" if hit else None
+            if not via:
+                tfp = near_pivot(zl, lo_piv + hi_piv) or near_pivot(zh, lo_piv + hi_piv)
+                via = f"Swing {tfp}" if tfp else None
+            side = str(z.get("side") or "").lower()
+            direction = "BUY" if side.startswith("bull") else "SELL" if side.startswith("bear") else ("BUY" if zh < (live or zh) else "SELL")
+            state = ""
+            if live is not None:
+                state = " · តម្លៃនៅក្នុង Zone" if zl <= live <= zh else (f" · {abs(((zl + zh) / 2) - live) / atr:.1f}×ATR ពីតម្លៃ" if atr else "")
+            if via:
+                ok += 1
+                lines.append(f"   ✅ {z.get('type')} {f(zl)}–{f(zh)} ← Deriv: {via}{state}")
+                idx = 0
+                for k in range(len(tf_candles) - 1, -1, -1):
+                    if tf_candles[k].low <= zh and tf_candles[k].high >= zl:
+                        idx = k
+                        break
+                confirmed_zones.append({"name": "IMG " + str(z.get("type") or "ZONE"), "direction": direction,
+                                        "low": zl, "high": zh, "abs_index": idx})
+            else:
+                lines.append(f"   ❌ {z.get('type')} {f(zl)}–{f(zh)} ← រកមិនឃើញក្នុង Deriv (អាចជា Zone គូរដោយដៃ/ចាស់){state}")
+        add("zones", 20, ok / len(zlist), f"Zone ក្នុងរូប {ok}/{len(zlist)} ត្រូវនឹងទិន្នន័យ Deriv")
+    else:
+        add("zones", 20, None, "Zone: គ្មាន Zone ដែលអានបាន ឬគ្មាន Deriv Candle គ្រប់គ្រាន់")
+    # 5) swings / liquidity / drawn levels
+    HIGH_T, LOW_T = ("HH", "LH", "EQH", "BSL", "PDH"), ("LL", "HL", "EQL", "SSL", "PDL")
+    checks = []
+    for s_ in (p1.get("swings") or []):
+        if isinstance(s_, dict) and _safe_num(s_.get("price")) is not None:
+            checks.append((str(s_.get("type", "")).upper(), _safe_num(s_["price"])))
+    for s_ in (p1.get("liquidity") or []):
+        if isinstance(s_, dict) and _safe_num(s_.get("price")) is not None and str(s_.get("type", "")).upper() != "SWEEP":
+            checks.append((str(s_.get("type", "")).upper(), _safe_num(s_["price"])))
+    for v in (p1.get("drawn_levels") or [])[:6]:
+        if _safe_num(v) is not None:
+            checks.append(("LEVEL", _safe_num(v)))
+    checks = checks[:14]
+    if checks and (hi_piv or lo_piv):
+        ok = 0
+        for t, price in checks:
+            pool = hi_piv if t in HIGH_T else lo_piv if t in LOW_T else hi_piv + lo_piv
+            if near_pivot(price, pool):
+                ok += 1
+        add("swings", 20, ok / len(checks), f"Swing/Liquidity/Level ក្នុងរូប {ok}/{len(checks)} ត្រូវនឹង Pivot Deriv (±0.35×ATR)")
+    else:
+        add("swings", 20, None, "Swing/Liquidity: គ្មានតម្លៃដែលអានបាន ឬគ្មាន Deriv Candle គ្រប់គ្រាន់")
+    # 6) trend
+    vis = str(p1.get("trend_visible") or "").upper()
+    fr_bias = ((ict.get("frames") or {}).get(ctf) or {}).get("bias")
+    py_bias = fr_bias if fr_bias in ("BULLISH", "BEARISH", "NEUTRAL") else (get_trend_by_ema(tf_candles) if tf_candles else None)
+    want = {"UP": "BULLISH", "DOWN": "BEARISH", "RANGE": "NEUTRAL"}.get(vis)
+    if want and py_bias:
+        if want == py_bias:
+            add("trend", 10, 1.0, f"ទិសដៅក្នុងរូប ({vis}) ស្រប Deriv {ctf} ({py_bias})")
+        elif "NEUTRAL" in (want, py_bias):
+            add("trend", 10, 0.5, f"ទិសដៅក្នុងរូប ({vis}) ខុសបន្តិចពី Deriv {ctf} ({py_bias})")
+        else:
+            add("trend", 10, 0.0, f"ទិសដៅក្នុងរូប ({vis}) ផ្ទុយពី Deriv {ctf} ({py_bias})")
+    else:
+        add("trend", 10, None, "ទិសដៅ: មិនអាចប្រៀបធៀប")
+    usable = [(w, s) for _, w, s, _ in comps if s is not None]
+    if len(usable) < 2:
+        return {"score": None, "grade": "N/A", "short": "🔎 Deriv Verify: ទិន្នន័យមិនគ្រប់គ្រាន់",
+                "lines": lines, "confirmed_zones": confirmed_zones, "comps": comps}
+    score = int(round(sum(w * s for w, s in usable) / sum(w for w, _ in usable) * 100))
+    grade = "STRONG" if score >= 75 else "OK" if score >= 55 else "WEAK"
+    icon = "✅" if score >= 75 else "⚠️" if score >= 55 else "❌"
+    parts = []
+    for name, _w, s, _t in comps:
+        if s is None or name == "instrument":
+            continue
+        label = {"price": "Price", "axis": "Axis", "zones": "Zones", "swings": "Swings", "trend": "Trend"}[name]
+        parts.append(f"{label} {'✅' if s >= 0.75 else '⚠️' if s >= 0.4 else '❌'}")
+    return {"score": score, "grade": grade, "short": f"🔎 Deriv Verify {icon} <b>{score}/100</b> {grade} · " + " · ".join(parts),
+            "lines": lines, "confirmed_zones": confirmed_zones, "comps": comps}
+
+
+def _v29_send_verified_chart(chat_id, symbol, ctf, candles, live, plan, confirmed_zones, ver, src_name):
+    """Deriv TradingView-style chart: Python plan + zones/levels that the screenshot showed AND Deriv confirmed."""
+    try:
+        vis = list(candles)[-V29_TV_CANDLES:]
+        off = len(candles) - len(vis)
+        payload = _lyli_zone_payload(vis, live)
+        zones = [{"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"], "index": z["index"]}
+                 for z in payload.get("zones", [])[-5:]]
+        for z in confirmed_zones:
+            zones.append({"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"],
+                          "index": max(0, z.get("abs_index", off) - off)})
+        levels = [{"name": ("Range High" if "High" in lv["name"] else "Range Low"), "price": lv["price"]}
+                  for lv in payload.get("levels", []) if "Range" in lv["name"]]
+        levels += _v29_day_level_rows(symbol, live)
+        foot = "Image Analysis · zones tagged IMG = read from your screenshot and confirmed on Deriv candles"
+        path = _v29_tv_render(symbol, ctf, candles, src_name, live, plan, zones, levels, footer=foot)
+        score_txt = "" if ver.get("score") is None else f" · Deriv Verify {ver['score']}/100"
+        cap = (f"📊 <b>{html.escape(symbol)} {html.escape(ctf)}</b> · Deriv TradingView-style{score_txt}\n"
+               + ("ផែនការ Python (Entry/SL/TP) បង្ហាញជា Long/Short box · IMG = Zone ក្នុងរូបដែល Deriv បញ្ជាក់"
+                  if plan else "មិនមាន Trade Plan · បង្ហាញតែ Zone/Level ដែលបានផ្ទៀងផ្ទាត់"))
+        ctx = getattr(_TG_CTX, "v", None) or {}
+        _lyli_telegram_upload(chat_id, "sendPhoto", "photo", path, cap, ctx.get("thread_id"))
+    except ImportError:
+        print("V29 verified chart skipped: matplotlib not installed")
+    except Exception as exc:
+        traceback.print_exc()
+        print("V29 verified chart failed:", type(exc).__name__, exc)
+
+
+def _v29_image_flow(chat_id, msg_id, symbol, file_id=None, retry=None):
+    """IMAGE SIGNAL V29. The AI only READS the screenshot. Deriv candles = ground truth; Python decides
+    direction / Entry / SL / TP. New: Deriv Verification of the screenshot + Deriv TradingView-style chart."""
+    menu = kb([[('🏠 Menu', 'menu_main')]])
+    if (not GEMINI_API_KEY or GEMINI_API_KEY.startswith('PASTE_')) and not GROQ_API_KEY:
+        plain(chat_id, msg_id, '⚠️ No AI key set. AI is only used to READ the chart image · '
+                               'set GEMINI_API_KEY and/or GROQ_API_KEY.', menu)
+        return
+    t0 = time.time()
+    progress = '⏳ 1/3 · 📷 កំពុងរៀបចំរូបភាព + Micro-crop…'
+    if msg_id:
+        plain(chat_id, msg_id, progress)
+    else:
+        res = tg('sendMessage', chat_id=chat_id, text=progress)
+        msg_id = res['result']['message_id'] if res and res.get('ok') else None
+    raw = None
+    try:
+        raw = download_photo(file_id) if file_id else None
+    except Exception as exc:
+        print('AI image download error:', exc)
+    if raw is None:
+        plain(chat_id, msg_id, '⚠️ មិនអាចទាញយករូបភាពបានទេ។ សូមផ្ញើរូបម្ដងទៀត។', retry or menu)
+        return
+    image = _shrink_image(raw)
+    crops = _micro_crops(raw)
+    quality = _image_quality(raw)
+
+    plain(chat_id, msg_id, f'🔎 2/3 · AI អានរូប ({len(crops)} Micro-crop) + ទាញ Deriv {symbol}…')
+    grounds = {}
+
+    def ground_worker(sym):
+        try:
+            grounds[sym] = _ground_symbol(sym)
+        except Exception as exc:
+            traceback.print_exc()
+            grounds[sym] = {"ok": False, "err": f"{type(exc).__name__}: {exc}"}
+    gth = threading.Thread(target=ground_worker, args=(symbol,), daemon=True)
+    gth.start()
+    p1 = _pass1_read(image, crops, symbol)
+    if not p1:
+        plain(chat_id, msg_id, '⚠️ AI មិនអាចអានរូបភាពបានទេ · សូមផ្ញើរូបឱ្យច្បាស់ជាងនេះ ឬចុច Retry។', retry or menu)
+        return
+    detected, sym_status = _image_symbol_match(p1.get('instrument'), symbol)
+    gsym = detected if sym_status == 'MISMATCH' and detected in SYMBOLS_MAP else symbol
+    if gsym != symbol:
+        ground_worker(gsym)
+    gth.join(timeout=45)
+    g = grounds.get(gsym) or {"ok": False, "err": "market data timeout"}
+    grounded = bool(g.get("ok"))
+
+    dec = SYMBOLS_MAP.get(gsym, {}).get('decimals', 2)
+    ict = g.get('ict') or {}
+    live = g.get('live') if grounded else None
+    ctf = _norm_chart_tf(p1.get('chart_timeframe')) or 'M15'
+    chart_last = _safe_num(p1.get('last_price'))
+    tf_candles, atr_tf, micro_txt = [], 0.0, 'unavailable'
+    anchor = None
+    if grounded:
+        if chart_last is not None and str(p1.get('image_type', '')).upper() == 'LIVE_MARKET_CHART':
+            try:
+                _an = _anchored_ict(gsym, chart_last)
+                if _an['ok']:
+                    anchor = _an
+                    ict, live = _an['ict'], chart_last
+            except Exception as exc:
+                print('Image anchor error:', type(exc).__name__, exc)
+        try:
+            _, _, tf_candles, _ = fetch_data(gsym, ctf, allow_twelve=True)
+        except Exception:
+            tf_candles = []
+        if anchor and anchor['candles'].get(ctf):
+            tf_candles = anchor['candles'][ctf]
+        atr_tf = (calc_atr(tf_candles) if tf_candles
+                  else (ict.get('frames', {}).get('M15') or {}).get('atr', 0) or 0)
+        if tf_candles:
+            micro_txt = _micro_plain(microstructure_read(tf_candles, live, atr_tf), dec)
+    sync, sync_diff, sync_tol = _price_sync(chart_last, live, atr_tf)
+    if anchor:
+        sync = 'ANCHORED'
+        sync_diff = abs(chart_last - (anchor['yahoo_live'] or chart_last))
+        if sync_tol is None:
+            sync_tol = max(3.0 * (atr_tf or 0.0), abs(chart_last) * 0.0025)
+    src_name = str(g.get("src") or "Deriv") if grounded else "Deriv"
+
+    # ---- VERIFY (new): what the AI read vs real Deriv candles ----
+    ver = {"score": None, "grade": "N/A", "short": "", "lines": [], "confirmed_zones": []}
+    if grounded:
+        try:
+            plain(chat_id, msg_id, '🔎 2.5/3 · ផ្ទៀងផ្ទាត់រូបជាមួយ Deriv Candle…')
+            d_live = _safe_num(anchor["yahoo_live"]) if anchor else live          # real Deriv price (anchor["yahoo_live"] = Deriv M1 close)
+            vsync = _price_sync(chart_last, d_live, atr_tf)[0] if d_live is not None else "UNKNOWN"
+            ver = _v29_verify_image(p1, gsym, ctf, tf_candles, d_live, atr_tf, dec, sym_status, vsync, ict,
+                                    anchor["candles"] if anchor else None)
+        except Exception as exc:
+            traceback.print_exc()
+            print('V29 verify error:', type(exc).__name__, exc)
+
+    # ---- DECIDE: Python only ----
+    plain(chat_id, msg_id, '🧮 3/3 · Python វិភាគ ICT + គណនា Entry / SL / TP…')
+    s = get_settings(chat_id)
+    image_type = str(p1.get('image_type', 'MIXED_OR_UNCLEAR')).upper()
+    if image_type not in ('LIVE_MARKET_CHART', 'EDUCATIONAL_CHART', 'MIXED_OR_UNCLEAR'):
+        image_type = 'MIXED_OR_UNCLEAR'
+    py_dir = str(ict.get('direction', 'WAIT'))
+    py_score = int(ict.get('score', 0) or 0)
+    bias = str(ict.get('bias', 'NEUTRAL')).upper()
+    bias = bias if bias in ('BULLISH', 'BEARISH', 'NEUTRAL') else 'NEUTRAL'
+    score = py_score
+    notes = list(quality['warns'])
+    if quality['score'] < 55:
+        score = max(0, score - 8)
+    if ver.get('score') is not None and ver['score'] < 40:
+        score = max(0, score - 8)                         # evidence can only LOWER confidence
+        notes.append(f"⚠️ Deriv Verify ទាប ({ver['score']}/100) · ព័ត៌មានក្នុងរូបភាគច្រើនមិនត្រូវនឹង Deriv · ប្រើ Python/Deriv ជាគោល")
+    if sym_status == 'MISMATCH':
+        notes.append(f"⚠️ រូបនេះជា {detected} មិនមែន {symbol} · ប្រើទិន្នន័យ {detected}")
+    elif sym_status == 'UNKNOWN':
+        notes.append('ℹ️ មិនអាចអាន Symbol ពីរូប · ផ្ទៀងផ្ទាត់ដោយតម្លៃ Deriv ប៉ុណ្ណោះ')
+
+    direction = py_dir if py_dir in ('BUY', 'SELL') else 'WAIT'
+    status = ''
+    levels = {k: None for k in ('entry', 'sl', 'tp1', 'tp2', 'tp3')}
+    rr, src, entry_type = [None, None, None], '', 'Market'
+    if not grounded:
+        direction = 'WAIT'
+        status = 'WAIT — Deriv/market data unavailable · Python មិនអាចវិភាគបាន'
+    elif image_type != 'LIVE_MARKET_CHART':
+        direction = 'WAIT'
+        status = 'WAIT — រូបនេះមិនមែនជា Live chart (' + image_type.replace('_', ' ') + ')'
+    elif direction == 'WAIT':
+        status = 'WAIT — Python ICT: ' + str(ict.get('status') or 'NO CLEAR SETUP')
+    elif sym_status == 'MISMATCH' and gsym == symbol:
+        status = 'BIAS ONLY — chart instrument (' + str(detected) + ') differs from selected ' + symbol
+    elif sync not in ('SYNC', 'ANCHORED'):
+        status = ('BIAS ONLY — screenshot price ' + ('differs from' if sync in ('NEAR', 'OFF') else 'not readable vs')
+                  + ' Deriv market (' + sync + ') · chart may be old or another feed')
+    elif score < IMAGE_MIN_SCORE:
+        status = f'BIAS ONLY — Python ICT score {score}/100 below {IMAGE_MIN_SCORE}'
+    else:
+        cand = []
+        plan = ict.get('plan')
+        if plan:
+            cand.append(('Python ICT zone plan', {k: plan[k] for k in levels}))
+        try:
+            sl_, t1_, t2_, t3_, *_ = calculate_structure_sl_tp(live, direction, tf_candles, atr_tf, gsym, s)
+            cand.append(('Python ATR/structure (market)', {'entry': live, 'sl': sl_, 'tp1': t1_, 'tp2': t2_, 'tp3': t3_}))
+        except Exception as exc:
+            print('structure SL/TP error:', exc)
+        for name, lv in cand:
+            if _validate_plan(direction, lv['entry'], lv['sl'], [lv['tp1'], lv['tp2'], lv['tp3']], atr_tf, live):
+                levels, src = dict(lv), name
+                break
+        if not src:
+            status = 'BIAS ONLY — no Entry/SL/TP set passed risk validation'
+    if src:
+        risk = abs(levels['entry'] - levels['sl'])
+        rr = [round(abs(levels[k] - levels['entry']) / risk, 1) for k in ('tp1', 'tp2', 'tp3')]
+        entry_type = 'Market' if abs(levels['entry'] - live) <= 0.35 * (atr_tf or risk) else 'Limit'
+    else:
+        direction = 'WAIT'
+
+    tf_txt = html.escape(str(p1.get('chart_timeframe') or 'UNKNOWN')[:20])
+    instrument = html.escape(str(p1.get('instrument') or 'UNKNOWN')[:30])
+    itype_txt = image_type.replace('_', ' ')
+    icon = '🟢' if direction == 'BUY' else '🔴' if direction == 'SELL' else '🟡'
+    f_ = lambda v: fmt(v, dec)
+    L = [f'{icon} <b>IMAGE SIGNAL · {direction}</b>',
+         f'📷 {instrument} · {tf_txt} · {itype_txt}',
+         f'🧭 Bias <b>{bias}</b> · Python ICT <b>{score}/100</b>\n{_cbar(score, 10, (65, 50))}']
+    if src:
+        L += ['━━━━━━━━━━━━━━━',
+              f'<pre>📍 Entry  {f_(levels["entry"])}  ({entry_type})\n🛑 SL     {f_(levels["sl"])}\n'
+              f'✅ TP1    {f_(levels["tp1"])}  1:{rr[0]}\n✅ TP2    {f_(levels["tp2"])}  1:{rr[1]}\n'
+              f'🏆 TP3    {f_(levels["tp3"])}  1:{rr[2]}</pre>',
+              f'🔧 Levels: {html.escape(src)}']
+    elif status:
+        L += ['━━━━━━━━━━━━━━━', f'ℹ️ {html.escape(status)}']
+    L.append('━━━━━━━━━━━━━━━')
+    if grounded:
+        sync_icon = {'SYNC': '✅', 'ANCHORED': '📌', 'NEAR': '⚠️', 'OFF': '❌'}.get(sync, '❔')
+        yl = anchor["yahoo_live"] if anchor else None
+        L += [f'🛰 <b>{html.escape(src_name)}</b> (Primary: Deriv)',
+              (f'💵 Chart <code>{f_(chart_last)}</code> (តម្លៃពិត) · Deriv <code>{f_(yl)}</code> · {sync_icon} {sync}' if anchor else
+               f'💵 Deriv <code>{f_(live)}</code> · Chart <code>{"—" if chart_last is None else f_(chart_last)}</code> · Sync {sync_icon} {sync}')]
+        if ver.get('short'):
+            L.append(ver['short'])
+        L += [f'🧱 ICT {html.escape(py_dir)} {py_score}/100 · {_ict_mtf_row(ict.get("frames"))}',
+              f'🕒 {html.escape(str(g["sess"].get("name")))} · {html.escape(str(g["sess"].get("quality")))}']
+        why = [_reason_kh(x) for x in (ict.get('reasons') or [])[:4]]
+        if why:
+            L += ['━━━━━━━━━━━━━━━'] + [html.escape(x) for x in why]
+    else:
+        L.append(f'🛰 Deriv/Yahoo: មិនអាចទាញបាន ({html.escape(str(g.get("err"))[:80])})')
+    if anchor:
+        _dl = anchor.get('delay')
+        notes.insert(0, '📌 Candle Deriv ត្រូវបានរំកិលតាមតម្លៃ Chart' +
+                     (f' · ចាស់ ~{_dl:.0f} នាទី' if _dl is not None and _dl > 3 else '') +
+                     f' · ភ្ជាប់ទៅតម្លៃ {fmt(chart_last, dec)}' +
+                     (f' · Offset Deriv/Broker {anchor["shift"]:+.{dec}f}' if anchor['shift'] else ''))
+    L += [html.escape(n)[:160] for n in notes[:4]]
+    L += ['━━━━━━━━━━━━━━━',
+          f'🐍 Python បង្កើត Signal · AI អានរូបតែប៉ុណ្ណោះ · Deriv ផ្ទៀងផ្ទាត់ · ⏱ {time.time()-t0:.0f}s',
+          '<i>⚠️ Analysis only · មិនមែនជាដំបូន្មានហិរញ្ញវត្ថុ</i>']
+    card = '\n'.join(x for x in L if x)
+
+    day = (g.get('day') or {}) if grounded else {}
+    D = [f'📋 IMAGE SIGNAL DETAILS · {symbol}',
+         f'ប្រភេទរូប: {image_type} · TF (grounded): {ctf} · Image quality {quality["score"]}',
+         '',
+         '👁 អ្វីដែល AI អានពីរូប (Facts):',
+         _p1_facts_text(p1, dec),
+         '',
+         '🐍 Python:',
+         f'Direction: {direction} · Bias: {bias} · ICT {py_dir} {py_score}/100 · Status: {ict.get("status", "N/A")}',
+         f'Sync={sync} (Δ={None if sync_diff is None else round(sync_diff, dec)}, tol={None if sync_tol is None else round(sync_tol, dec)})',
+         f'Microstructure[{ctf}]: {micro_txt}',
+         'Day levels: ' + (', '.join(f'{k}={f_(v)}' for k, v in day.items()) or 'n/a'),
+         f'Levels source: {src or "none"} · Status: {status or "OK"}',
+         f'AI legibility: {p1.get("legibility", "n/a")} · unreadable: {"; ".join(str(x) for x in (p1.get("unreadable") or [])[:5]) or "none"}',
+         '⚠️ Screenshot អាចមានកំហុសក្នុងការអាន Pixel/Price axis · Deriv អាចខុសបន្តិចពី Broker របស់អ្នក។ សូមផ្ទៀងផ្ទាត់លើ Chart ផ្ទាល់។']
+    D.extend(_image_details_explainer(gsym, p1, ict, live, chart_last, sync, sync_diff,
+                                      sync_tol, image_type, ctf, g.get("src"), dec))
+    if ver.get('lines'):
+        D += ['', '9️⃣ 🔎 Deriv Verification (រូប ↔ ទិន្នន័យ Deriv)',
+              f'• Score: {ver["score"] if ver["score"] is not None else "N/A"}/100 · {ver["grade"]}'] + ver['lines'] + [
+              '📘 Score នេះវាស់ថា "អ្វីដែល AI អានពីរូប" ត្រូវនឹង Candle ពិតពី Deriv កម្រិតណា។ វាអាចបន្ថយទំនុកចិត្ត តែមិនដែលបង្កើន Signal ឬបង្កើត Entry ទេ។']
+    detail_text = '\n'.join(D).replace('Yahoo Finance អាចយឺត និងអាចខុសពី Broker/Exchange',
+                                       'Deriv អាចខុសបន្តិចពី Broker/Exchange របស់អ្នក')
+    if msg_id:
+        if len(RESULTS) > 100:
+            RESULTS.pop(next(iter(RESULTS)))
+        RESULTS[(chat_id, msg_id)] = {'card': card, 'details': detail_text, 'symbol': symbol}
+    show(chat_id, msg_id, card, ai_buttons(symbol))
+
+    # ---- Deriv TradingView-style chart under the card (does not delay the card) ----
+    if grounded and tf_candles and len(tf_candles) >= 30:
+        try:
+            chart_plan = {k: levels[k] for k in ('entry', 'sl', 'tp1', 'tp2', 'tp3')} if src else None
+            threading.Thread(target=_v29_send_verified_chart,
+                             args=(chat_id, gsym, ctf, tf_candles, live, chart_plan, ver.get('confirmed_zones') or [], ver, src_name),
+                             daemon=True).start()
+        except Exception as exc:
+            print('V29 chart thread:', type(exc).__name__, exc)
+
+
+# Replace the INNERMOST original image flow; every wrapper above it (hybrid review, Deriv/Twelve scopes,
+# V28.5 multi-vision merge) keeps working because they resolve this name at call time.
+_LYLI_V253_OLD_RUN_AI_INNER = _v29_image_flow
+
+_V29_PREV_ANCHORED_ICT = _anchored_ict
+
+
+def _anchored_ict(symbol, user_price):
+    out = _V29_PREV_ANCHORED_ICT(symbol, user_price)
+    try:
+        if out.get("ok") and out.get("ict") is not None:
+            src1, src15 = _SRC.get((symbol, "M1"), "?"), _SRC.get((symbol, "M15"), "?")
+            out["ict"]["market_data_source"] = f"M1={src1}; M15={src15}; Deriv-first (Twelve/Yahoo fallback)"
+        elif "Twelve Data និង Yahoo Backup" in str(out.get("err")):
+            out["err"] = "Deriv / Twelve / Yahoo មិនមាន Candle Data"
+    except Exception:
+        pass
+    return out
+
+
+# =============================================================================
+# /derivfeed (admin)
+# =============================================================================
+def _v29_derivfeed_text():
+    cl = _DVC_CLIENT
+    now = time.time()
+    feed = _DERIV_FEED
+    ds = _deriv_symbol(LILY_SYMBOL)
+    tick = feed.ticks.get(ds) if ds else None
+    lines = ["🛰 <b>DERIV FEED · V29</b>", "━━━━━━━━━━━━━━",
+             f"Primary candles: {'ON' if DERIV_CANDLES_PRIMARY else 'OFF'} · scanners (ICT/ICT PRO/Scan Zone): "
+             f"{'Deriv' if DERIV_CANDLES_SCANNERS else 'Yahoo-only'} · alert workers (Analyze/Instant/radar): {'Deriv' if DERIV_CANDLES_ALERTS else 'Yahoo'}",
+             f"Candle link: <code>{html.escape(cl.status)}</code>" + (f" · {html.escape(cl.url)}" if cl.url else "") +
+             (f" · {cl.latency_ms}ms" if cl.latency_ms is not None else "") +
+             (" · ⚠ websocket-client មិនទាន់ដំឡើង (requirements.txt)" if cl.status == "no-lib" else ""),
+             f"Budget: {cl.per_minute_used()}/{DERIV_CANDLES_PER_MIN} req/min · OK {cl.n_ok} · Error {cl.n_err}"
+             + (f" · ⏸ cooldown {int(cl.down_until - now)}s" if cl.down_until > now else "")
+             + (f" · RateLimit {int(cl.block_until - now)}s" if cl.block_until > now else ""),
+             f"Tick feed: <code>{html.escape(str(feed.status))}</code> · {LILY_SYMBOL} tick "
+             + (f"{int(now - tick['t'])}s មុន @ {tick['price']}" if tick else "—"),
+             ("Last error: <code>" + html.escape(cl.last_err[:140]) + f"</code> ({int(now - cl.last_err_t)}s មុន)") if cl.last_err else "Last error: none",
+             "━━━━━━━━━━━━━━"]
+    row = []
+    for tf in ("M1", "M5", "M15", "M30", "H1", "H2", "H4"):
+        st = _DVC_STORE.get((LILY_SYMBOL, tf))
+        src = _SRC.get((LILY_SYMBOL, tf), "—")
+        row.append(f"{tf}: {src}" + (f" ({len(st['rows'])}c, {int(now - st['t'])}s)" if st else ""))
+    lines.append(f"{LILY_SYMBOL} → " + " | ".join(row))
+    snap = _LILY_SNAPSHOT_CACHE.get("value") or {}
+    lines.append(f"Lily snapshot: {html.escape(str(snap.get('source', '—')))} · {int(now - _LILY_SNAPSHOT_CACHE.get('t', 0))}s មុន")
+    lines.append("Chart: TradingView-style (Deriv) · Chart-IMG reference " + ("ON" if LILY_CHARTIMG_REFERENCE else "OFF"))
+    return "\n".join(lines)
+
+
+_V29_PREV_HANDLE_UPDATE = handle_update
+
+
+def handle_update(update):
+    try:
+        m = (update or {}).get("message") or {}
+        txt = (m.get("text") or "").strip()
+        if txt and txt.split()[0].lower().split("@", 1)[0] == "/derivfeed":
+            chat_id = (m.get("chat") or {}).get("id")
+            user_id = (m.get("from") or {}).get("id")
+            _TG_CTX.v = {"chat_id": chat_id, "thread_id": _msg_thread(m)}
+            if not is_admin(user_id if user_id is not None else chat_id):
+                tg("sendMessage", chat_id=chat_id, text="🔒 <b>ADMIN ONLY</b>", parse_mode="HTML")
+            else:
+                tg("sendMessage", chat_id=chat_id, text=_v29_derivfeed_text(), parse_mode="HTML")
+            return
+    except Exception:
+        traceback.print_exc()
+    return _V29_PREV_HANDLE_UPDATE(update)
+
+
+BUILD_VERSION = "V29 DERIV PRIMARY DATA · IMAGE ANALYSIS PRO (DERIV VERIFY) · LILY TRADINGVIEW-STYLE CHART"
+BUILD_LOG = [("V29", "Deriv is now the PRIMARY candle + price source (ticks_history candles over a persistent socket, incremental refresh, paced under "
+                     "the Deriv limit, Yahoo = labelled fallback; ICT/ICT PRO/Scan Zone scanners stay Yahoo-only unless DERIV_CANDLES_SCANNERS=1). "
+                     "Lily snapshot, advisor and /chart use Deriv; chart redrawn in TradingView style (right price scale, last-price tag + countdown, "
+                     "OB/FVG zones, PDH/PDL/Asia, EMA 20/50, Long/Short boxes). Analyze Pic: Deriv Verification of screenshot facts "
+                     "(instrument, price, axis, zones, swings, trend) + Deriv TradingView-style chart with the Python plan; evidence can only lower "
+                     "confidence. /derivfeed status")] + BUILD_LOG
+
+
+# Start after all V29 wrappers have been defined.
 if __name__ == "__main__":
     main()
