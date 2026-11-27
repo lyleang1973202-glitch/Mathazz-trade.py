@@ -13088,7 +13088,7 @@ def _handle_topic_command(m, chat_id, user_id, args):
         topic_id = _msg_thread(m)
         if not category:
             return ("❌ Category មិនត្រឹមត្រូវ។ ប្រើ៖\n"
-                    "<code>instant</code> · <code>analyze</code> · <code>scanzone</code> · <code>ictpro</code> · <code>chat</code> · <code>image</code>")
+                    "<code>instant</code> · <code>analyze</code> · <code>ict</code> · <code>ictpro</code> · <code>chat</code> · <code>image</code>")
         if not topic_id:
             return "❌ សូមផ្ញើ Command នេះ <b>នៅក្នុង Topic</b> ដែលចង់ចុះឈ្មោះ មិនមែននៅ General ទេ។"
         _topic_register(chat_id, topic_id, category, user_id,
@@ -21335,5 +21335,379 @@ BUILD_LOG = [("V28", "Group alerts (Analyze, Scan Zone, ICT PRO, Instant, radar)
                      "Analyze no longer skips its whole lifecycle scan when Deriv is quiet. /alertcheck diagnoses Topic delivery")] + BUILD_LOG
 
 
+# =============================================================================
+# V28.1 · ANALYZE PRO + CRT (CANDLE RANGE THEORY) · ACCURACY FIRST
+# Additive Analyze-only layer. Instant / ICT PRO / ICT engines and topic routing
+# are intentionally untouched. Twelve Data remains disabled for Analyze.
+# =============================================================================
+ANALYZE_CRT_ENABLED = (os.environ.get("ANALYZE_CRT_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+ANALYZE_CRT_REFERENCE_TF = "M15"
+ANALYZE_CRT_CONFIRM_TF = "M5"
+ANALYZE_CRT_MAX_REFERENCE_AGE_MIN = float(os.environ.get("ANALYZE_CRT_MAX_REFERENCE_AGE_MIN") or 45)
+
+
+def _v281_closed_candles(candles, timeframe, minimum=8):
+    """Return timestamp-verified closed candles only; never infer a close from an in-progress bar."""
+    minutes = {"M1": 1, "M5": 5, "M15": 15, "H1": 60, "H4": 240}.get(str(timeframe).upper())
+    if not minutes:
+        return []
+    out = []
+    for candle in list(candles or []):
+        age = _candle_age_min(candle)
+        # Candle.ts is the candle OPEN time. A small 0.25m allowance avoids
+        # excluding a candle because of timestamp rounding, but never accepts a forming bar.
+        if age is not None and age >= max(0.0, minutes - 0.25):
+            out.append(candle)
+    return out[-max(80, minimum):]
+
+
+def _v281_crt_mss(candles, direction, atr):
+    """M5 market-structure shift after the range raid; uses closed bars only."""
+    if len(candles) < 6 or not atr or atr <= 0:
+        return {"ok": False, "status": "INSUFFICIENT_M5", "break_level": None, "body_atr": 0.0}
+    last = candles[-1]
+    prior = candles[-5:-1]
+    if direction == "BUY":
+        level = max(float(c.high) for c in prior)
+        body_atr = max(0.0, float(last.close) - float(last.open)) / atr
+        ok = float(last.close) > level and float(last.close) > float(last.open)
+        return {"ok": bool(ok), "status": "BULLISH_MSS" if ok else "WAIT_BULLISH_MSS",
+                "break_level": level, "body_atr": round(body_atr, 3)}
+    level = min(float(c.low) for c in prior)
+    body_atr = max(0.0, float(last.open) - float(last.close)) / atr
+    ok = float(last.close) < level and float(last.close) < float(last.open)
+    return {"ok": bool(ok), "status": "BEARISH_MSS" if ok else "WAIT_BEARISH_MSS",
+            "break_level": level, "body_atr": round(body_atr, 3)}
+
+
+def _v281_analyze_crt(symbol, force=False):
+    """M15 Candle-1 range -> Candle-2 one-sided sweep/reclaim -> M5 MSS confirmation."""
+    base = {"enabled": bool(ANALYZE_CRT_ENABLED), "valid": False, "confirmed": False,
+            "direction": "WAIT", "status": "DISABLED" if not ANALYZE_CRT_ENABLED else "NO_VALID_CRT",
+            "reference_tf": "M15", "confirmation_tf": "M5", "range_high": None,
+            "range_low": None, "sweep_extreme": None, "entry_confirmation": "WAIT",
+            "reason": "CRT is disabled" if not ANALYZE_CRT_ENABLED else "No closed-candle range sweep/reclaim"}
+    if not ANALYZE_CRT_ENABLED:
+        return base
+    try:
+        # Explicitly prohibit Twelve Data: Analyze uses its own non-Twelve candle path.
+        with _feature_data_access(allow_twelve=False, lock=True, anchor=True):
+            _l15, _s15, raw15, _n15 = fetch_data(symbol, "M15", force, allow_twelve=False)
+            _l5, _s5, raw5, _n5 = fetch_data(symbol, "M5", force, allow_twelve=False)
+            _l1, _s1, raw1, _n1 = fetch_data(symbol, "H1", force, allow_twelve=False)
+        m15 = _v281_closed_candles(raw15, "M15", 3)
+        m5 = _v281_closed_candles(raw5, "M5", 8)
+        h1 = _v281_closed_candles(raw1, "H1", 3)
+        if len(m15) < 3:
+            base.update(status="INSUFFICIENT_M15", reason="ត្រូវការទៀន M15 ដែលបិទរួចយ៉ាងតិច 3")
+            return base
+        if len(m5) < 6:
+            base.update(status="INSUFFICIENT_M5", reason="ត្រូវការទៀន M5 ដែលបិទរួចសម្រាប់ MSS")
+            return base
+        c1, c2 = m15[-2], m15[-1]
+        hi, lo = float(c1.high), float(c1.low)
+        width = hi - lo
+        if not all(math.isfinite(x) for x in (hi, lo, float(c2.high), float(c2.low), float(c2.close))) or width <= 0:
+            base.update(status="INVALID_RANGE", reason="M15 reference range មិនត្រឹមត្រូវ")
+            return base
+        swept_ssl = float(c2.low) < lo and lo < float(c2.close) < hi
+        swept_bsl = float(c2.high) > hi and lo < float(c2.close) < hi
+        if swept_ssl and swept_bsl:
+            base.update(status="DUAL_SWEEP_AMBIGUOUS", reason="Candle 2 បោសទាំង High និង Low — មិនជ្រើសទិស")
+            return base
+        if not swept_ssl and not swept_bsl:
+            outside_close = float(c2.close) > hi or float(c2.close) < lo
+            base.update(status="BREAKOUT_ACCEPTANCE" if outside_close else "NO_SWEEP",
+                        reason="Candle 2 បិទក្រៅ Range — breakout acceptance មិនមែន CRT" if outside_close
+                               else "មិនទាន់មាន sweep និង reclaim លើ M15")
+            base.update(range_high=hi, range_low=lo, equilibrium=(hi + lo) / 2.0)
+            return base
+        direction = "BUY" if swept_ssl else "SELL"
+        atr5 = float(calc_atr(m5, 14) or 0.0)
+        mss = _v281_crt_mss(m5, direction, atr5)
+        # H1 is context, not a substitute for the M5 trigger. Opposing H1 close structure blocks confirmation.
+        h1_bias = "NEUTRAL"
+        if len(h1) >= 20:
+            h1_closes = [float(c.close) for c in h1]
+            e20 = _v21_ema_series(h1_closes, 20)
+            h1_bias = "BULLISH" if h1_closes[-1] > e20[-1] else "BEARISH" if h1_closes[-1] < e20[-1] else "NEUTRAL"
+        htf_conflict = h1_bias not in ("NEUTRAL", "BULLISH" if direction == "BUY" else "BEARISH")
+        age = _candle_age_min(c2)
+        fresh = age is not None and age <= ANALYZE_CRT_MAX_REFERENCE_AGE_MIN
+        confirmed = bool(mss.get("ok") and not htf_conflict and fresh)
+        status = "CRT_CONFIRMED" if confirmed else (
+            "STALE_REFERENCE" if not fresh else "HTF_CONFLICT" if htf_conflict else mss.get("status", "WAIT_MSS"))
+        base.update({"valid": True, "confirmed": confirmed, "direction": direction, "status": status,
+                     "sweep": "SSL SWEEP + RECLAIM" if direction == "BUY" else "BSL SWEEP + RECLAIM",
+                     "range_high": hi, "range_low": lo, "equilibrium": (hi + lo) / 2.0,
+                     "sweep_extreme": float(c2.low if direction == "BUY" else c2.high),
+                     "candle2_close": float(c2.close), "candle2_age_min": round(age, 1) if age is not None else None,
+                     "m5_mss": mss, "h1_context": h1_bias,
+                     "entry_confirmation": mss.get("status", "WAIT"),
+                     "reason": ("M15 sweep/reclaim + M5 MSS confirmed" if confirmed else
+                                "CRT sweep found; wait for M5 MSS / fresh reference / H1 alignment")})
+        return base
+    except Exception as exc:
+        base.update(status="DATA_ERROR", reason=f"CRT data error: {type(exc).__name__}")
+        print("V28.1 Analyze CRT error:", symbol, type(exc).__name__, exc)
+        return base
+
+
+_V281_PREV_BUILD_ANALYZE = build_analyze
+
+def build_analyze(symbol, force=False):
+    """Add CRT confirmation to Analyze only; preserve legacy zones, scoring and all other engines."""
+    result = _V281_PREV_BUILD_ANALYZE(symbol, force)
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+    try:
+        crt = _v281_analyze_crt(symbol, force=force)
+        result["crt_analyze"] = crt
+        now = dict(result.get("now") or {})
+        mode = str(now.get("mode", "WAIT")).upper()
+        side = str(now.get("side", "WAIT")).upper()
+        # Hard gate: a legacy BUY/SELL is not considered confirmed without a fresh
+        # one-sided M15 sweep/reclaim, M5 MSS, and no opposing H1 context.
+        directional_mode = mode in ("BUY", "SELL", "LIMIT BUY", "LIMIT SELL")
+        requested_side = mode.replace("LIMIT ", "") if directional_mode else side
+        if directional_mode and not (crt.get("confirmed") and crt.get("direction") == requested_side):
+            now["mode"] = "WAIT"
+            now["why"] = "CRT gate: " + str(crt.get("reason", "M15 sweep/reclaim + M5 MSS មិនទាន់បញ្ជាក់"))
+            now["crt_blocked"] = True
+        elif directional_mode:
+            now["crt_blocked"] = False
+            now["crt_bonus"] = 8
+            now["why"] = str(now.get("why", "")) + " · CRT M15 + M5 MSS confirmed"
+        else:
+            now["crt_blocked"] = False
+        result["now"] = now
+        # Refresh the visible lifecycle label so it cannot call a CRT-blocked signal CONFIRMED.
+        old_lifecycle = result.get("alert_lifecycle") or {}
+        if now.get("mode") == "WAIT" and old_lifecycle.get("state") == "CONFIRMED":
+            result["alert_lifecycle"] = dict(old_lifecycle, state="WATCH",
+                reason="CRT gate blocked directional confirmation")
+        audit = dict(result.get("direction_audit") or {})
+        audit.update({"crt_status": crt.get("status"), "crt_direction": crt.get("direction"),
+                      "crt_confirmed": bool(crt.get("confirmed")), "crt_blocked": bool(now.get("crt_blocked")),
+                      "now_mode": now.get("mode", "WAIT")})
+        result["direction_audit"] = audit
+    except Exception as exc:
+        print("V28.1 Analyze CRT attach error:", symbol, type(exc).__name__, exc)
+        result["crt_analyze"] = {"enabled": bool(ANALYZE_CRT_ENABLED), "valid": False,
+                                 "confirmed": False, "direction": "WAIT", "status": "ATTACH_ERROR"}
+    return result
+
+
+# Gate only NEW Analyze plans. Existing plans keep their original TP/SL/CUT/CANCEL
+# lifecycle even after CRT is no longer present, so management alerts are never lost.
+_V281_PREV_ANALYZE_PLAN_LIFECYCLE = _analyze_plan_lifecycle
+
+def _analyze_plan_lifecycle(chat_id, symbol, a):
+    try:
+        plan = a.get("trade_plan") if isinstance(a, dict) else None
+        if plan:
+            with _pro_db() as con:
+                _analyze_plan_init(con)
+                row = con.execute("SELECT 1 FROM analyze_plan_state_v11 WHERE chat_id=? AND symbol=?",
+                                  (int(chat_id), str(symbol))).fetchone()
+            if not row:
+                crt = a.get("crt_analyze") or {}
+                if not (crt.get("confirmed") and crt.get("direction") == plan.get("dir")):
+                    return  # no fresh M15 CRT + M5 MSS: do not create/announce a new plan
+    except Exception as exc:
+        print("V28.1 Analyze CRT lifecycle gate:", symbol, type(exc).__name__, exc)
+        return  # fail closed for NEW plans; existing plan state is not modified
+    return _V281_PREV_ANALYZE_PLAN_LIFECYCLE(chat_id, symbol, a)
+
+
+BUILD_VERSION = "V28.1 ANALYZE PRO · CRT M15 SWEEP/RECLAIM + M5 MSS · ACCURACY FIRST"
+BUILD_LOG = [("V28.1", "Analyze-only CRT gate: closed M15 Candle-1 range, Candle-2 one-sided sweep/reclaim, M5 MSS confirmation, fresh-candle validation and H1 conflict check; no fabricated probabilities; Twelve Data disabled for Analyze; Instant/ICT PRO/ICT and topic routing unchanged")] + BUILD_LOG
+
+
+# =============================================================================
+# V28.2 · DEDICATED ICT TOPIC + YAHOO-ONLY ICT SCANNERS · 30-SECOND CYCLE
+# - The existing Scan Zone engine is the ICT engine and now routes to category "ict".
+# - ICT PRO keeps its independent category, worker, subscriptions and lifecycle.
+# - Both engines scan Yahoo OHLC/quote only, irrespective of ALERT_USE_DERIV.
+# - Both worker loops run every 30 seconds by default; dedupe/cooldowns still prevent spam.
+# - Instant and Analyze routing/data policies are not changed.
+# =============================================================================
+ICT_SCAN_INTERVAL = max(5, int(os.environ.get("ICT_SCAN_INTERVAL", "30") or 30))
+ICT_ALERT_COOLDOWN_SECONDS = max(30, int(os.environ.get("ICT_ALERT_COOLDOWN_SECONDS", "30") or 30))
+PRO_ALERT_INTERVAL = ICT_SCAN_INTERVAL
+SCANZONE_ALERT_EVERY_S = ICT_ALERT_COOLDOWN_SECONDS
+
+_V282_PREV_DERIV_BLOCKED = _v28_deriv_blocked
+def _v28_deriv_blocked():
+    """ICT and ICT PRO workers are always Yahoo-only; other alert workers retain V28 policy."""
+    if _v28_alert_ctx():
+        worker = str((getattr(_TG_CTX, "v", None) or {}).get("worker") or "").lower()
+        if worker in ("scanzone", "ict", "ictpro"):
+            return True
+    return _V282_PREV_DERIV_BLOCKED()
+
+
+def _v282_alertcheck_text(chat_id):
+    alive = {t.name for t in threading.enumerate() if t.is_alive()}
+    rows = (("analyze", "🧭 Analyze", "analyze_swing_subscriptions", "mathazz-v10-2-swing-assistant"),
+            ("ict", "📘 ICT", "scan_zone_alert_subscriptions", "scanzone-alerts"),
+            ("ictpro", "👑 ICT PRO", "alert_subscriptions", "ict-structure-alerts"),
+            ("instant", "⚡ Instant", "instant_monitor_subscriptions", "instant-monitor"))
+    cid = int(chat_id)
+    lines = ["🩺 <b>ALERT CHECK</b>", "━━━━━━━━━━━━━━",
+             f"📡 ICT + ICT PRO = <b>Yahoo Finance only</b> · Scan <b>{ICT_SCAN_INTERVAL}s</b> · Alert cooldown <b>{ICT_ALERT_COOLDOWN_SECONDS}s</b>",
+             ("📡 Analyze / Instant = Deriv Primary · Yahoo Backup" if ALERT_USE_DERIV
+              else "📡 Analyze / Instant = Yahoo only (ALERT_USE_DERIV=0)"),
+             "━━━━━━━━━━━━━━"]
+    for cat, label, table, thread in rows:
+        tid = _topic_id_for(cid, cat)
+        explicit = set()
+        try:
+            with _pro_db() as con:
+                explicit = {r[0] for r in con.execute(
+                    f"SELECT symbol FROM {table} WHERE chat_id=? AND active=1", (cid,)).fetchall()}
+        except Exception:
+            pass
+        auto = {sy for c, sy in _registry_subs(cat) if c == cid}
+        n = len(explicit | auto)
+        sent = _V28_SEND_LOG.get((_topic_norm(cat, "analyze"), str(cid)))
+        last = "—" if not sent else (("✅ " if sent[1] else "❌ ") + _v28_ago(sent[0]) + " មុន")
+        lines.append(f"{label}: Topic {('<code>%s</code>' % tid) if tid is not None else '❌ មិនទាន់ចុះឈ្មោះ'}"
+                     f" · Symbol {n} · Worker {'✅' if thread in alive else '❌'} · ផ្ញើចុងក្រោយ {last}")
+    err = _V28_LAST_TG_ERR.get(str(cid))
+    if err:
+        lines.extend(["━━━━━━━━━━━━━━",
+                      f"⚠️ Telegram error ចុងក្រោយ ({_v28_ago(err[0])} មុន · HTTP {err[1]} · Topic {err[3]}):",
+                      f"<code>{html.escape(err[2])}</code>"])
+    lines.extend(["━━━━━━━━━━━━━━",
+                  "ចុះឈ្មោះក្នុង Topic នីមួយៗ៖ <code>/topic set analyze</code> · <code>/topic set ict</code> · <code>/topic set ictpro</code> · <code>/topic set instant</code>",
+                  "ICT = Scan Zone engine · ICT PRO = Structure-event engine"])
+    return "\n".join(lines)
+
+
+_v28_alertcheck_text = _v282_alertcheck_text
+
+# V28.2 is additive: preserve the four-topic taxonomy; legacy scanzone command remains
+# an alias of ICT so old group setups continue to work without creating a fifth topic.
+BUILD_VERSION = "V28.2 ICT + ICT PRO YAHOO-ONLY · 30S SCAN · DEDICATED ICT TOPIC"
+BUILD_LOG = [("V28.2", "ICT topic explicitly registered as /topic set ict; legacy scanzone remains an alias; ICT and ICT PRO alert workers use Yahoo-only data and scan every 30s by default; per-event dedupe/cooldown retained; Instant and Analyze unchanged")] + BUILD_LOG
+
+
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# V28.3 HOTFIX · ICT + ICT PRO ALERT DELIVERY / YAHOO-ONLY DATA
+# Fixes:
+#   1) Force Twelve Data OFF inside ICT and ICT PRO scanner contexts (V28.2
+#      blocked Deriv but could still inherit the Twelve Data allow flag).
+#   2) Make the ICT topic registry lookup explicit and keep Scan Zone as an
+#      internal alias of the user's ICT topic (no fifth Telegram topic).
+#   3) Add worker heartbeats/subscription diagnostics so an alive-but-idle
+#      scanner is distinguishable from a Telegram delivery failure.
+# =============================================================================
+_V283_PREV_FETCH_DATA = fetch_data
+
+def fetch_data(symbol, timeframe, force=False, allow_twelve=None):
+    """ICT/ICT PRO scanners are Yahoo-only; other features retain their own provider policy."""
+    if _v28_alert_ctx():
+        _worker_name = str((getattr(_TG_CTX, "v", None) or {}).get("worker") or "").lower()
+        if _worker_name in ("scanzone", "ict", "ictpro"):
+            return _V283_PREV_FETCH_DATA(symbol, timeframe, force, allow_twelve=False)
+    return _V283_PREV_FETCH_DATA(symbol, timeframe, force, allow_twelve)
+
+
+# The ICT engine is the existing Scan Zone engine. Normalize old and new names
+# to the same ICT destination and ensure auto-subscription reads ICT registry rows.
+_V283_PREV_REGISTRY_SUBS = _registry_subs
+
+def _registry_subs(*categories):
+    expanded = []
+    for category in categories:
+        c = str(category or "").strip().lower()
+        if c in ("ict", "scanzone", "scan", "zone"):
+            expanded.extend(("ict", "scanzone"))
+        else:
+            expanded.append(category)
+    # Preserve order while removing duplicate category names.
+    expanded = tuple(dict.fromkeys(expanded))
+    return _V283_PREV_REGISTRY_SUBS(*expanded)
+
+
+# Keep Telegram delivery failures visible in logs, including non-HTTP failures.
+_V283_PREV_TOPIC_SEND = _topic_send
+
+def _topic_send(category, **params):
+    result = _V283_PREV_TOPIC_SEND(category, **params)
+    try:
+        cat = _topic_norm(category, "analyze")
+        if cat == "ict":
+            label = "ICT"
+        elif cat == "ictpro":
+            label = "ICT PRO"
+        else:
+            label = cat.upper()
+        if not result or not result.get("ok"):
+            _err = _V28_LAST_TG_ERR.get(str(params.get("chat_id")))
+            print("V28.3 ALERT DELIVERY FAILED:",
+                  "engine=" + label,
+                  "chat=" + str(params.get("chat_id")),
+                  "thread=" + str(params.get("message_thread_id")),
+                  "telegram=" + (str(_err[1]) + " " + str(_err[2]) if _err else "no Telegram success response"))
+    except Exception as _log_exc:
+        print("V28.3 delivery diagnostic error:", type(_log_exc).__name__)
+    return result
+
+
+# A separate heartbeat for ICT PRO; its original worker only logged send errors,
+# so an empty subscription list looked exactly like a broken alert engine.
+_V283_PRO_WORKER = _pro_alert_worker_legacy
+
+def _pro_alert_worker_legacy():
+    _last_heartbeat = 0.0
+    while True:
+        try:
+            with _pro_db() as _con:
+                _subs_db = _con.execute(
+                    "SELECT chat_id,symbol FROM alert_subscriptions WHERE active=1"
+                ).fetchall()
+            _subs = list(dict.fromkeys(
+                [(int(c), sy) for c, sy in _subs_db] + _registry_subs("ictpro")
+            ))
+            if time.time() - _last_heartbeat >= 60:
+                _last_heartbeat = time.time()
+                _symbols = sorted({str(sy) for _, sy in _subs})
+                print(f"ICT PRO Yahoo scanner alive · subscriptions={len(_subs)} · symbols={','.join(_symbols) or 'NONE'} · interval={PRO_ALERT_INTERVAL}s")
+            if not _subs:
+                time.sleep(PRO_ALERT_INTERVAL)
+                continue
+        except Exception as _diag_exc:
+            print("ICT PRO subscription diagnostic:", type(_diag_exc).__name__, _diag_exc)
+        # The original worker re-reads subscriptions and performs its full
+        # independent structure/event logic. It remains isolated from ICT.
+        _V283_PRO_WORKER()
+
+
+
+def _v283_ict_subscription_snapshot():
+    try:
+        with _pro_db() as _con:
+            _con.execute("""CREATE TABLE IF NOT EXISTS scan_zone_alert_subscriptions (
+                chat_id INTEGER NOT NULL, symbol TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT, PRIMARY KEY(chat_id,symbol))""")
+            _db_subs = _con.execute(
+                "SELECT chat_id,symbol FROM scan_zone_alert_subscriptions WHERE active=1"
+            ).fetchall()
+        _subs = list(dict.fromkeys(
+            [(int(c), sy) for c, sy in _db_subs] + _registry_subs("ict")
+        ))
+        return _subs
+    except Exception as _exc:
+        print("ICT subscription diagnostic:", type(_exc).__name__, _exc)
+        return []
+
+
+BUILD_VERSION = "V28.3 ICT + ICT PRO ALERT HOTFIX · YAHOO-ONLY · 30S"
+BUILD_LOG = [("V28.3", "Fix ICT/ICT PRO scanner provider isolation (force Twelve Data off in both scanner contexts); normalize ICT topic registry lookup; improve Telegram delivery diagnostics and ICT PRO subscription heartbeat; keep four topics and independent engines")] + BUILD_LOG
+
