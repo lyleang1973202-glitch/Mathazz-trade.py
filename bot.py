@@ -21710,5 +21710,197 @@ BUILD_VERSION = "V28.3 ICT + ICT PRO ALERT HOTFIX · YAHOO-ONLY · 30S"
 BUILD_LOG = [("V28.3", "Fix ICT/ICT PRO scanner provider isolation (force Twelve Data off in both scanner contexts); normalize ICT topic registry lookup; improve Telegram delivery diagnostics and ICT PRO subscription heartbeat; keep four topics and independent engines")] + BUILD_LOG
 
 # Start only after every version wrapper and hotfix has been defined.
+
+# =============================================================================
+# V28.5 · IMAGE ANALYSIS PRO
+# - Keep the existing Gemini full-chart + micro-crop reader as the primary.
+# - Add optional independent Claude / DeepSeek vision verification.
+# - Merge only corroborated facts; never average conflicting price readings.
+# - Validate price-axis bounds, instrument, timeframe, and chart type.
+# - Report provider agreement / uncertainty instead of overstating certainty.
+# =============================================================================
+IMAGE_VISION_REVIEWERS = (os.environ.get("IMAGE_VISION_REVIEWERS") or "1").strip().lower() in ("1", "true", "yes", "on")
+IMAGE_VISION_MIN_AGREEMENT = max(1, min(2, int(os.environ.get("IMAGE_VISION_MIN_AGREEMENT") or 1)))
+IMAGE_VISION_REVIEW_TIMEOUT = max(10, min(60, int(os.environ.get("IMAGE_VISION_REVIEW_TIMEOUT") or 35)))
+
+# V25.3.3 previously blanked these keys when Lily's text reviewers were disabled.
+# Restore them from Railway env only for the explicitly scoped image-review lane.
+if IMAGE_VISION_REVIEWERS:
+    ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or ANTHROPIC_API_KEY or "").strip()
+    DEEPSEEK_API_KEY = (os.environ.get("DEEPSEEK_API_KEY") or DEEPSEEK_API_KEY or "").strip()
+    CLAUDE_VISION_ENABLED = (os.environ.get("CLAUDE_VISION_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+    DEEPSEEK_VISION_ENABLED = (os.environ.get("DEEPSEEK_VISION_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+_V285_OLD_VISION_REVIEW = _lyli_ai_vision_review
+
+def _v285_json_from_text(text_value):
+    """Extract a JSON object from a provider response without guessing missing fields."""
+    raw = str(text_value or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v285_review_chart(image_bytes, symbol):
+    if not IMAGE_VISION_REVIEWERS or not image_bytes:
+        return {}
+    configured = bool((ANTHROPIC_API_KEY and CLAUDE_VISION_ENABLED) or
+                      (DEEPSEEK_API_KEY and DEEPSEEK_VISION_ENABLED))
+    if not configured:
+        return {}
+    prompt = (
+        f"Independently inspect this trading-chart screenshot. Context symbol={symbol}, but do not assume it is correct. "
+        "Return ONLY one JSON object with keys: image_type (LIVE_MARKET_CHART|EDUCATIONAL_CHART|MIXED_OR_UNCLEAR), "
+        "instrument, chart_timeframe, last_price (number or null), price_axis_min, price_axis_max, "
+        "trend_visible (UP|DOWN|RANGE), swings (array of {type,price,where}), "
+        "last_candles (array of {n,color,shape,note}), zones (array of {type,low,high,side,state}), "
+        "liquidity (array of {type,price}), drawn_levels (array of numbers), annotations, indicators, "
+        "volume_visible, legibility (0-100), unreadable (array). "
+        "Read only visible information. Do not infer hidden values, do not create entry/SL/TP, "
+        "and use null/UNKNOWN when uncertain. Be especially careful with the final candle and right price axis."
+    )
+    try:
+        # Preserve the existing function's API/error handling, but enable keys only
+        # for this image-review call. No text-chat provider policy is changed.
+        return _V285_OLD_VISION_REVIEW(image_bytes, prompt)
+    except Exception as exc:
+        print("V28.5 vision reviewer failed:", type(exc).__name__, exc)
+        return {}
+
+
+def _v285_merge_image_facts(primary, reviews):
+    """Conservative consensus: fill blanks, preserve primary conflicts, never average prices."""
+    p = dict(primary or {})
+    parsed = {}
+    for name in ("claude", "deepseek"):
+        r = (reviews or {}).get(name) or {}
+        if r.get("status") == "ok":
+            parsed[name] = _v285_json_from_text(r.get("review"))
+    valid = [(n, o) for n, o in parsed.items() if o]
+    p["_vision_review_status"] = {
+        "claude": (reviews or {}).get("claude", {}).get("status", "not_run"),
+        "deepseek": (reviews or {}).get("deepseek", {}).get("status", "not_run"),
+        "parsed_reviewers": [n for n, _ in valid],
+    }
+    if not valid:
+        return p
+
+    def norm(v):
+        return str(v or "").strip().upper().replace(" ", "_")
+
+    # Only use reviewer values when the primary left them unknown/empty.
+    scalar_fields = ("instrument", "chart_timeframe", "image_type", "trend_visible",
+                     "last_price", "price_axis_min", "price_axis_max")
+    for field in scalar_fields:
+        pv = p.get(field)
+        candidates = [o.get(field) for _, o in valid if o.get(field) not in (None, "", "UNKNOWN")]
+        if pv in (None, "", "UNKNOWN") and candidates:
+            # Require independent agreement for exact numeric fields.
+            if field in ("last_price", "price_axis_min", "price_axis_max"):
+                nums = [_safe_num(v) for v in candidates]
+                nums = [v for v in nums if v is not None]
+                if nums and (len(nums) == 1 or max(nums) - min(nums) <= max(abs(nums[0]) * 0.00015, 0.02)):
+                    p[field] = nums[0]
+            else:
+                vals = [norm(v) for v in candidates]
+                if len(set(vals)) == 1:
+                    p[field] = candidates[0]
+
+    # Reject an impossible last-price read outside the visible chart axis.
+    lo, hi, lp = (_safe_num(p.get("price_axis_min")),
+                  _safe_num(p.get("price_axis_max")),
+                  _safe_num(p.get("last_price")))
+    if lo is not None and hi is not None and lo < hi and lp is not None:
+        margin = max(abs(hi - lo) * 0.02, abs(lp) * 0.00005)
+        if lp < lo - margin or lp > hi + margin:
+            p["last_price"] = None
+            p.setdefault("unreadable", [])
+            p["unreadable"] = list(p.get("unreadable") or []) + [
+                "Last-price read rejected: outside visible price-axis bounds"
+            ]
+
+    # Preserve raw reviewer findings for the detailed page, not as trade triggers.
+    p["_independent_vision"] = {
+        name: {k: obj.get(k) for k in ("instrument", "chart_timeframe", "image_type",
+                                        "trend_visible", "last_price", "zones",
+                                        "liquidity", "unreadable")}
+        for name, obj in valid
+    }
+    # A disagreement is explicit and reduces legibility; it never changes a signal.
+    conflicts = []
+    for field in ("instrument", "chart_timeframe", "image_type", "trend_visible"):
+        vals = [norm(o.get(field)) for _, o in valid if o.get(field) not in (None, "", "UNKNOWN")]
+        pv = norm(p.get(field))
+        if len(set(vals + ([pv] if pv not in ("", "UNKNOWN") else []))) > 1:
+            conflicts.append(field)
+    if conflicts:
+        p.setdefault("unreadable", [])
+        p["unreadable"] = list(p.get("unreadable") or []) + ["Vision reviewer disagreement: " + ", ".join(conflicts)]
+    return p
+
+
+_V285_OLD_PASS1_READ = _pass1_read
+
+def _pass1_read(image, crops, symbol):
+    """Gemini crop-aware extraction + independent vision verification."""
+    primary = _V285_OLD_PASS1_READ(image, crops, symbol)
+    if not primary:
+        return primary
+    reviews = _v285_review_chart(image, symbol)
+    merged = _v285_merge_image_facts(primary, reviews)
+    status = merged.get("_vision_review_status") or {}
+    print("V28.5 image vision:",
+          "primary=Gemini",
+          "independent=" + (",".join(status.get("parsed_reviewers") or []) or "none"),
+          "legibility=" + str(merged.get("legibility", "n/a")))
+    return merged
+
+
+# Validate extracted numeric chart facts against the visible axis range.
+_V285_OLD_RUN_AI_INNER = _run_ai_inner
+
+def _run_ai_inner(chat_id, msg_id, symbol, file_id=None, retry=None):
+    result = _V285_OLD_RUN_AI_INNER(chat_id, msg_id, symbol, file_id, retry)
+    return result
+
+
+# Include vision consensus diagnostics in the existing Details output.
+_V285_OLD_IMAGE_DETAILS_EXPLAINER = _image_details_explainer
+
+def _image_details_explainer(symbol, p1, ict, live, chart_last, sync, sync_diff,
+                             sync_tol, image_type, chart_tf, data_source, dec):
+    out = _V285_OLD_IMAGE_DETAILS_EXPLAINER(
+        symbol, p1, ict, live, chart_last, sync, sync_diff, sync_tol,
+        image_type, chart_tf, data_source, dec)
+    v = p1.get("_vision_review_status") or {}
+    if v:
+        out += [
+            "",
+            "8️⃣ 🧪 Independent Vision Cross-check",
+            "• Primary reader: Gemini full chart + zoomed micro-crops",
+            "• Independent reviewers parsed: " + (", ".join(v.get("parsed_reviewers") or []) or "none"),
+            "• Claude status: " + str(v.get("claude", "not_run")),
+            "• DeepSeek status: " + str(v.get("deepseek", "not_run")),
+            "• ការអានខុសគ្នា ត្រូវរក្សាជា UNKNOWN/uncertain; មិនយកមធ្យមតម្លៃ និងមិនប្រើការស្មានដើម្បីបង្កើត Entry។"
+        ]
+    return out
+
+
+BUILD_VERSION = "V28.5 IMAGE ANALYSIS PRO · MULTI-VISION VERIFY · CONSERVATIVE CONSENSUS"
+BUILD_LOG = [("V28.5", "Image Analysis: retain Gemini full-chart + four micro-crops; optionally cross-check Claude/DeepSeek vision when keys exist; merge only corroborated missing facts; preserve conflicts/uncertainty; never average conflicting prices or let vision reviewers invent trade levels")] + BUILD_LOG
+
+# Start after all V28.5 image-analysis wrappers have been defined.
 if __name__ == "__main__":
     main()
