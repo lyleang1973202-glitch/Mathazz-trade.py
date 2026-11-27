@@ -21593,8 +21593,6 @@ BUILD_VERSION = "V28.2 ICT + ICT PRO YAHOO-ONLY · 30S SCAN · DEDICATED ICT TOP
 BUILD_LOG = [("V28.2", "ICT topic explicitly registered as /topic set ict; legacy scanzone remains an alias; ICT and ICT PRO alert workers use Yahoo-only data and scan every 30s by default; per-event dedupe/cooldown retained; Instant and Analyze unchanged")] + BUILD_LOG
 
 
-if __name__ == "__main__":
-    main()
 
 
 # =============================================================================
@@ -21711,3 +21709,6 @@ def _v283_ict_subscription_snapshot():
 BUILD_VERSION = "V28.3 ICT + ICT PRO ALERT HOTFIX · YAHOO-ONLY · 30S"
 BUILD_LOG = [("V28.3", "Fix ICT/ICT PRO scanner provider isolation (force Twelve Data off in both scanner contexts); normalize ICT topic registry lookup; improve Telegram delivery diagnostics and ICT PRO subscription heartbeat; keep four topics and independent engines")] + BUILD_LOG
 
+# Start only after every version wrapper and hotfix has been defined.
+if __name__ == "__main__":
+    main()
