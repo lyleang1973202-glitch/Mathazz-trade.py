@@ -23376,8 +23376,812 @@ def handle_callback(chat_id, msg_id, data, user_id=None):
     return _V293_PREV_HANDLE_CALLBACK(chat_id, msg_id, data, user_id)
 
 
-BUILD_VERSION = "V29.3 PHOTO+CAPTION DASHBOARD · V29.2 IMAGE CHART ATTACHED · V29.1 ALERT RECOVERY · DERIV PRIMARY DATA · IMAGE ANALYSIS PRO · LILY TRADINGVIEW-STYLE CHART"
-BUILD_LOG = [("V29.3", "Image Analyze: dashboard is one photo message (TradingView-style chart + short caption + buttons); full text in Details; text dashboard kept as fallback")] + [("V29.2", "Image Analyze: Deriv TradingView-style chart is sent as a reply attached to the dashboard card with Entry/SL/TP caption; visible error note if it fails")] + [("V29.1", "Alert recovery: ICT PRO outer worker marked + never exits; watchdog restarts dead Analyze/ICT/ICT PRO/Instant workers and prints Deriv health; DERIV_CANDLES_BG_SHARE configurable (0.8)")] + [("V29", "Deriv is now the PRIMARY candle + price source (ticks_history candles over a persistent socket, incremental refresh, paced under "
+# =============================================================================
+# V29.4 · PRO TRADINGVIEW CHART  +  WEEKEND BTC AUTO MODE (Instant + Analyze)
+#
+#  1) _v29_tv_render_locked is replaced by a professional multi-panel renderer:
+#       price panel  : candles, EMA 20/50/200, session VWAP, session shading (Asia/London/NY),
+#                      swing labels HH/HL/LH/LL, BOS / CHoCH lines, EQH/EQL liquidity,
+#                      Premium/Discount + 50% EQ, FVG/OB zones that stop when mitigated,
+#                      Long/Short position tool with distance + % + RR, last-price tag + countdown
+#       volume panel : volume bars + MA20            (only when the feed has volume)
+#       RSI panel    : RSI 14 with 30/50/70 bands
+#       header       : OHLC, change, ATR, RSI, LIVE/CLOSED chip, Weekend-BTC chip
+#     Every optional layer is wrapped: if one fails the chart is still drawn; if the whole renderer
+#     fails the V29.3 renderer is used as fallback (so /chart and Image Analyze never break).
+#
+#  2) Weekend mode: while Forex/Gold is closed (and on Cambodia Sat/Sun) the Instant Alert worker and
+#     the Analyze Alert worker automatically ADD BTCUSD for every chat that already has alerts on,
+#     and skip symbols whose session is CLOSED. An explicit OFF for BTCUSD is respected.
+#     Monday when the market opens, the normal symbol list is used again (no restart needed).
+#
+#  Env (all optional):
+#     WEEKEND_BTC_MODE=auto|always|off     (default auto)
+#     WEEKEND_BTC_SYMBOLS=BTCUSD           (comma list, e.g. BTCUSD,ETHUSD)
+#     LILY_TV_UTC_OFFSET=7                 (chart clock; default 0 = UTC)
+#     LILY_TV_VOLUME / LILY_TV_RSI / LILY_TV_STRUCTURE / LILY_TV_SESSIONS = 1|0   (default 1)
+#     LILY_TV_BB=1                         (Bollinger bands, default 0)
+# =============================================================================
+def _v294_flag(name, default=True):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+WEEKEND_BTC_MODE = (os.environ.get("WEEKEND_BTC_MODE") or "auto").strip().lower()
+WEEKEND_BTC_SYMBOLS = tuple(x.strip().upper() for x in
+                            (os.environ.get("WEEKEND_BTC_SYMBOLS") or "BTCUSD").split(",") if x.strip())
+try:
+    V294_TV_UTC_OFFSET = float(os.environ.get("LILY_TV_UTC_OFFSET") or 0)
+except ValueError:
+    V294_TV_UTC_OFFSET = 0.0
+V294_TV_VOLUME = _v294_flag("LILY_TV_VOLUME", True)
+V294_TV_RSI = _v294_flag("LILY_TV_RSI", True)
+V294_TV_STRUCTURE = _v294_flag("LILY_TV_STRUCTURE", True)
+V294_TV_SESSIONS = _v294_flag("LILY_TV_SESSIONS", True)
+V294_TV_BB = _v294_flag("LILY_TV_BB", False)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Weekend helpers
+# ---------------------------------------------------------------------------------------------------------
+def _v294_ict_weekday(now=None):
+    t = time.time() if now is None else float(now)
+    return time.gmtime(t + 7 * 3600).tm_wday                      # Phnom Penh = UTC+7 (0=Mon … 5=Sat, 6=Sun)
+
+
+def _v294_weekend(now=None):
+    """True on Cambodia Saturday/Sunday or whenever the FX/Gold week is closed."""
+    if WEEKEND_BTC_MODE in ("off", "0", "false", "no"):
+        return False
+    if WEEKEND_BTC_MODE == "always":
+        return True
+    try:
+        if _v294_ict_weekday(now) in (5, 6):
+            return True
+        return not _gold_open(now)
+    except Exception:
+        return _v294_ict_weekday(now) in (5, 6)
+
+
+def _v294_closed(symbol, now=None):
+    try:
+        return session_info(symbol, now).get("quality") == "CLOSED"
+    except Exception:
+        return False
+
+
+def _v294_symbol_order():
+    keys = list(SYMBOLS_MAP)
+    if _v294_weekend():
+        first = [s for s in WEEKEND_BTC_SYMBOLS if s in SYMBOLS_MAP]
+        keys = first + [k for k in keys if k not in first]
+    return keys
+
+
+def _v294_btn(symbol, prefix):
+    meta = SYMBOLS_MAP[symbol]
+    mark = ""
+    if _v294_weekend():
+        if symbol in WEEKEND_BTC_SYMBOLS:
+            mark = "🌙 "
+        elif _v294_closed(symbol):
+            mark = "⚫ "
+    return (f"{mark}{meta['icon']} {symbol}", f"{prefix}{symbol}")
+
+
+_V294_WEEKEND_LINE = "\n\n🌙 <b>Weekend Mode</b> · Forex/Gold បិទ → ប្រើ <b>₿ BTCUSD</b> (24/7) · ⚫ = ទីផ្សារបិទ"
+
+_V294_PREV_MODE_SYMBOLS = mode_symbols
+
+
+def mode_symbols(mode):
+    text, markup = _V294_PREV_MODE_SYMBOLS(mode)
+    if not _v294_weekend():
+        return text, markup
+    try:
+        rows = chunk([_v294_btn(k, f"pick_{mode}_") for k in _v294_symbol_order()], 2)
+        rows.append([("⬅️ MAIN DASHBOARD", "menu_main")])
+        return text + _V294_WEEKEND_LINE, kb(rows)
+    except Exception as exc:
+        print("V29.4 weekend mode_symbols:", type(exc).__name__, exc)
+        return text, markup
+
+
+_V294_PREV_ANA_SYMBOLS_MENU = ana_symbols_menu
+
+
+def ana_symbols_menu():
+    text, markup = _V294_PREV_ANA_SYMBOLS_MENU()
+    if not _v294_weekend():
+        return text, markup
+    try:
+        rows = chunk([_v294_btn(k, "ana_") for k in _v294_symbol_order()], 2)
+        rows.append([("⬅️ MAIN DASHBOARD", "menu_main")])
+        return text + _V294_WEEKEND_LINE, kb(rows)
+    except Exception as exc:
+        print("V29.4 weekend ana_symbols_menu:", type(exc).__name__, exc)
+        return text, markup
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Weekend subscription expansion + one notice per chat per weekend
+# ---------------------------------------------------------------------------------------------------------
+_V294_NOTICE = {}
+_V294_HB = {"t": 0.0}
+
+
+def _v294_week_key():
+    shifted = time.time() + 7 * 3600 - 6 * 3600                  # Monday 00:00-05:00 (Cambodia) still belongs to the weekend
+    y, w, _d = datetime.fromtimestamp(shifted, timezone.utc).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _v294_notice_text(category):
+    engine = "⚡ Instant" if category == "instant" else "🧭 Analyze"
+    syms = " · ".join(f"₿ {s}" for s in WEEKEND_BTC_SYMBOLS if s in SYMBOLS_MAP) or "₿ BTCUSD"
+    return (f"🌙 <b>Weekend Mode · {engine} Alert</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"Forex / Gold បិទទីផ្សារ → Alert ប្តូរទៅ <b>{syms}</b> ស្វ័យប្រវត្តិ (ទីផ្សារ Crypto បើក 24/7)\n"
+            f"✅ Confirmation · Near Entry · Entry · TP · SL · Cancel · Cut ដូចធម្មតា\n"
+            f"🔁 ថ្ងៃច័ន្ទ ពេល Gold បើកវិញ Bot ត្រឡប់ទៅ Gold ដោយខ្លួនឯង")
+
+
+def _v294_weekend_notice(chats, category):
+    wk = _v294_week_key()
+    for cid in chats:
+        key = (int(cid), category, wk)
+        if key in _V294_NOTICE:
+            continue
+        _V294_NOTICE[key] = time.time()
+        try:
+            with _pro_db() as con:
+                con.execute("CREATE TABLE IF NOT EXISTS v294_weekend_notice ("
+                            "chat_id INTEGER NOT NULL, category TEXT NOT NULL, week_key TEXT NOT NULL, "
+                            "sent_at REAL, PRIMARY KEY(chat_id,category,week_key))")
+                seen = con.execute("SELECT 1 FROM v294_weekend_notice WHERE chat_id=? AND category=? AND week_key=?",
+                                   (int(cid), category, wk)).fetchone()
+                if seen:
+                    continue
+                con.execute("INSERT OR IGNORE INTO v294_weekend_notice(chat_id,category,week_key,sent_at) VALUES(?,?,?,?)",
+                            (int(cid), category, wk, time.time()))
+            _topic_send(category, chat_id=int(cid), text=_v294_notice_text(category), parse_mode="HTML")
+        except Exception as exc:
+            print("V29.4 weekend notice:", cid, category, type(exc).__name__, exc)
+
+
+def _v294_weekend_subs(subs, table, category):
+    """[(chat_id, symbol)] -> on a weekend: drop CLOSED symbols, add the weekend crypto symbols for every chat."""
+    subs = list(subs)
+    if not _v294_weekend():
+        return subs
+    off = set()
+    try:
+        with _pro_db() as con:
+            off = {(int(r[0]), str(r[1])) for r in
+                   con.execute("SELECT chat_id,symbol FROM %s WHERE active=0" % table).fetchall()}
+    except Exception:
+        pass
+    chats = sorted({int(c) for c, _s in subs})
+    closed = {}
+    kept = []
+    for c, s in subs:
+        if s not in closed:
+            closed[s] = _v294_closed(s)
+        if not closed[s]:
+            kept.append((int(c), s))
+    have = set(kept)
+    for c in chats:
+        for sym in WEEKEND_BTC_SYMBOLS:
+            if sym in SYMBOLS_MAP and (c, sym) not in off and (c, sym) not in have:
+                kept.append((c, sym))
+                have.add((c, sym))
+    notify = sorted({c for c, s in kept if s in WEEKEND_BTC_SYMBOLS})          # only chats that really get BTC
+    if notify:
+        _v294_weekend_notice(notify, category)
+    now = time.time()
+    if now - _V294_HB["t"] > 600:
+        _V294_HB["t"] = now
+        print(f"V29.4 WEEKEND MODE ({category}): chats={len(chats)} scanning={sorted({s for _c, s in kept})}")
+    return kept
+
+
+# ---- Instant Alert worker: identical to V27.3 + weekend expansion ----------------------------------------
+def _v294_instant_worker():
+    print(f"V29.4 Instant Alert worker: Deriv live price, {DERIV_SCAN_INTERVAL:g}s interval · weekend → {WEEKEND_BTC_SYMBOLS}")
+    while True:
+        _cycle_started = time.time()
+        try:
+            with _pro_db() as con:
+                subs = con.execute("SELECT chat_id,symbol FROM instant_monitor_subscriptions WHERE active=1").fetchall()
+            configured = {cid for cid, _topic in _scalp_alert_targets(None)}
+            try:
+                with _pro_db() as con:
+                    configured |= {int(r[0]) for r in con.execute(
+                        "SELECT chat_id FROM alert_topic_registry WHERE category='instant'").fetchall()}
+            except Exception as exc:
+                print("V27 Instant topic registry:", exc)
+            if configured:
+                subs = list(subs) + [(cid, sym) for cid in configured for sym in V9_SCAN_SYMBOLS]
+            subs = list(dict.fromkeys((int(c), str(s)) for c, s in subs if s in SYMBOLS_MAP))
+            subs = _v294_weekend_subs(subs, "instant_monitor_subscriptions", "instant")      # V29.4
+            groups = {}
+            for chat_id, symbol in subs:
+                settings = get_settings(chat_id)
+                groups.setdefault((symbol, _settings_sig(settings)), {"settings": settings, "chats": []})["chats"].append(chat_id)
+            for (symbol, _), group in groups.items():
+                _DERIV_CTX.enabled = True
+                try:
+                    _INSTANT_CTX.data = None
+                    up, shift = _instant_tw_anchor(symbol)
+                    if up is None:
+                        continue
+                    _INSTANT_CTX.user_price, _INSTANT_CTX.user_shift = up, shift
+                    try:
+                        with _feature_data_access(allow_twelve=False):
+                            result = _view_instant_impl(symbol, group["settings"], force=False)
+                    finally:
+                        _INSTANT_CTX.user_price, _INSTANT_CTX.user_shift = None, 0.0
+                    if isinstance(result, tuple):
+                        continue
+                    ctx = getattr(_INSTANT_CTX, "data", None)
+                    lanes = _instant_lane_results(symbol, group["settings"], ctx, result) if ctx else None
+                    for chat_id in group["chats"]:
+                        try:
+                            if lanes:
+                                for lane, lane_result in lanes:
+                                    _instant_monitor_process(chat_id, symbol, lane_result, lane)
+                            else:
+                                _instant_monitor_process(chat_id, symbol, result)
+                        except Exception as exc:
+                            print("V27 Instant alert send:", chat_id, symbol, type(exc).__name__, exc)
+                except Exception as exc:
+                    print("V27 Instant scan:", symbol, type(exc).__name__, exc)
+                    traceback.print_exc()
+                finally:
+                    _DERIV_CTX.enabled = False
+            time.sleep(max(0.0, DERIV_SCAN_INTERVAL - (time.time() - _cycle_started)))
+        except Exception as exc:
+            print("V29.4 Instant worker error:", type(exc).__name__, exc)
+            traceback.print_exc()
+            time.sleep(max(0.0, DERIV_SCAN_INTERVAL - (time.time() - _cycle_started)))
+
+
+# ---- Analyze Alert worker: identical to V19 + weekend expansion ------------------------------------------
+def _v294_analyze_worker():
+    print(f"V29.4 Analyze Alert worker active · interval={SWING_ALERT_INTERVAL}s · weekend → {WEEKEND_BTC_SYMBOLS}")
+    while True:
+        _cycle_started = time.time()
+        try:
+            with _pro_db() as con:
+                subs = con.execute("SELECT chat_id,symbol FROM analyze_swing_subscriptions WHERE active=1").fetchall()
+            subs = list(dict.fromkeys([(int(c), sy) for c, sy in subs] + _registry_subs("analyze")))
+            subs = [(c, s) for c, s in subs if s in SYMBOLS_MAP]
+            subs = _v294_weekend_subs(subs, "analyze_swing_subscriptions", "analyze")        # V29.4
+            _now_hb = time.time()
+            if _now_hb - _SWING_HB["t"] > 600:
+                _SWING_HB["t"] = _now_hb
+                print(f"Analyze worker alive · subs={len(subs)} · price_only={ANALYZE_PRICE_ONLY}"
+                      + ("  ⚠ NO subscriptions: run /topic set analyze or tap Analyze Alert ON" if not subs else ""))
+
+            def _one_sub(cs):
+                chat_id, symbol = cs
+                try:
+                    _swing_analyze_one(int(chat_id), str(symbol))
+                except Exception as exc:
+                    print("Swing Assistant symbol error:", symbol, type(exc).__name__, exc)
+            if subs:
+                with ThreadPoolExecutor(max_workers=min(ANALYZE_WORKERS, len(subs))) as _pool:
+                    list(_pool.map(_one_sub, subs))
+            with _pro_db() as con:
+                con.execute("DELETE FROM analyze_swing_event_log WHERE sent_at < ?", (time.time() - 45 * 86400,))
+        except Exception as exc:
+            print("V29.4 Analyze worker error:", type(exc).__name__, exc)
+            traceback.print_exc()
+        time.sleep(max(0.0, SWING_ALERT_INTERVAL - (time.time() - _cycle_started)))
+
+
+# Thread targets / watchdog look these names up at start time → the new workers are used everywhere.
+_instant_monitor_worker = _v28_worker(_v294_instant_worker, "instant")
+_analyze_swing_alert_worker = _v28_worker(_v294_analyze_worker, "analyze")
+
+
+# ---------------------------------------------------------------------------------------------------------
+# PRO CHART RENDERER
+# ---------------------------------------------------------------------------------------------------------
+_V294_THEME = {"panel": "#131722", "vol_up": "#26a69a", "vol_dn": "#ef5350", "rsi": "#b388ff", "vwap": "#e91e63",
+               "ema200": "#ffd54f", "bb": "#4fc3f7", "bos": "#4fc3f7", "choch": "#ffb74d", "eq": "#9598a1",
+               "asia": "#7e57c2", "london": "#42a5f5", "ny": "#ffa726", "weekend": "#ffb300"}
+
+
+def _v294_rsi(closes, period=14):
+    out = [None] * len(closes)
+    if len(closes) <= period:
+        return out
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / period, losses / period
+    out[period] = 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (period - 1) + max(d, 0.0)) / period
+        al = (al * (period - 1) + max(-d, 0.0)) / period
+        out[i] = 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+    return out
+
+
+def _v294_atr(h, l, cl, period=14):
+    if len(cl) < 2:
+        return float(h[-1] - l[-1]) if len(cl) else 0.0
+    tr = []
+    for i in range(1, len(cl)):
+        tr.append(max(h[i] - l[i], abs(h[i] - cl[i - 1]), abs(l[i] - cl[i - 1])))
+    tail = tr[-period:]
+    return float(sum(tail) / max(1, len(tail)))
+
+
+def _v294_fmt_vol(v):
+    v = float(v)
+    for lim, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(v) >= lim:
+            return f"{v / lim:.2f}{suf}"
+    return f"{v:.0f}"
+
+
+def _v294_structure(h, l, cl, left=3):
+    """Swing labels + BOS/CHoCH. Returns (labels[(i,price,'H'|'L',tag)], events[(kind,level,i0,i1,'UP'|'DN')], trend)."""
+    n = len(cl)
+    raw = []
+    for i in range(left, n - left):
+        wh = h[i - left:i + left + 1]
+        wl = l[i - left:i + left + 1]
+        if h[i] >= wh.max() and h[i] > wh.min():
+            raw.append((i, float(h[i]), "H"))
+        if l[i] <= wl.min() and l[i] < wl.max():
+            raw.append((i, float(l[i]), "L"))
+    raw.sort(key=lambda p: (p[0], p[2]))
+    clean = []
+    for p in raw:                                                   # keep alternating H/L, the most extreme of a run
+        if clean and clean[-1][2] == p[2]:
+            if (p[2] == "H" and p[1] >= clean[-1][1]) or (p[2] == "L" and p[1] <= clean[-1][1]):
+                clean[-1] = p
+        else:
+            clean.append(p)
+    labels, last_h, last_l = [], None, None
+    for i, pr, t in clean:
+        if t == "H":
+            tag = None if last_h is None else ("HH" if pr > last_h else "LH")
+            last_h = pr
+        else:
+            tag = None if last_l is None else ("HL" if pr > last_l else "LL")
+            last_l = pr
+        labels.append((i, pr, t, tag))
+    conf = sorted((i + left, i, pr, t) for i, pr, t, _tag in labels)
+    events, trend, ph, pl, ci = [], 0, None, None, 0
+    for k in range(n):
+        while ci < len(conf) and conf[ci][0] <= k:
+            _c, i, pr, t = conf[ci]
+            if t == "H":
+                ph = (i, pr)
+            else:
+                pl = (i, pr)
+            ci += 1
+        if ph is not None and cl[k] > ph[1]:
+            events.append(("CHoCH" if trend < 0 else "BOS", ph[1], ph[0], k, "UP"))
+            trend, ph = 1, None
+        elif pl is not None and cl[k] < pl[1]:
+            events.append(("CHoCH" if trend > 0 else "BOS", pl[1], pl[0], k, "DN"))
+            trend, pl = -1, None
+    return labels, events, trend
+
+
+def _v294_session_of(hour):
+    if 13 <= hour < 21:
+        return "NY"
+    if 7 <= hour < 13:
+        return "LON"
+    if 0 <= hour < 7:
+        return "ASIA"
+    return None
+
+
+def _v294_tv_render_locked(symbol, timeframe, candles, source="Deriv", live_price=None, plan=None,
+                           zones=None, levels=None, footer="", path=None, max_candles=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    import numpy as np
+    C = dict(_V29_TV)
+    T = _V294_THEME
+    allc = list(candles)
+    n = min(len(allc), max_candles or V29_TV_CANDLES)
+    if n < 20:
+        raise ValueError("Not enough candles to draw chart")
+    cs = allc[-n:]
+    dec = SYMBOLS_MAP.get(symbol, {}).get("decimals", 2)
+    ff = lambda v: f"{float(v):,.{dec}f}"
+    o = np.array([float(c.open) for c in cs]); h = np.array([float(c.high) for c in cs])
+    l = np.array([float(c.low) for c in cs]); cl = np.array([float(c.close) for c in cs])
+    ep = [(_lyli_time_seconds(c.ts) or 0) for c in cs]
+    off_s = V294_TV_UTC_OFFSET * 3600.0
+    tz_txt = "UTC" if not V294_TV_UTC_OFFSET else f"UTC{V294_TV_UTC_OFFSET:+g}"
+    vol_all = [getattr(c, "volume", None) for c in allc]
+    vol = np.array([float(getattr(c, "volume", 0) or 0) for c in cs])
+    has_vol = bool(V294_TV_VOLUME and (vol > 0).sum() >= max(10, n // 2))
+    has_rsi = bool(V294_TV_RSI and len(allc) >= 20)
+    x = np.arange(n)
+    up = cl >= o
+    rng = float(h.max() - l.min()) or 1.0
+    atr = _v294_atr(h, l, cl, 14)
+    right_pad = 18
+    live = float(live_price) if live_price is not None else float(cl[-1])
+    tf_sec = RT_TF_SEC.get(timeframe, 900)
+
+    # ---------------- figure + panels ----------------
+    panels = ["price"] + (["vol"] if has_vol else []) + (["rsi"] if has_rsi else [])
+    ratios = {"price": 6.2, "vol": 1.15, "rsi": 1.55}
+    top, bottom, gap = 0.855, 0.075, 0.010
+    avail = top - bottom - gap * (len(panels) - 1)
+    tot = sum(ratios[p] for p in panels)
+    fig = plt.figure(figsize=(14, 8.8), dpi=140, facecolor=C["bg"])
+    axes, y_top = {}, top
+    for p in panels:
+        hgt = avail * ratios[p] / tot
+        axes[p] = fig.add_axes([0.012, y_top - hgt, 0.903, hgt], sharex=axes.get("price"))
+        axes[p].set_facecolor(C["bg"])
+        y_top -= hgt + gap
+    ax = axes["price"]
+    col = [C["up"] if u else C["dn"] for u in up]
+
+    # ---------------- session shading + day separators ----------------
+    try:
+        if V294_TV_SESSIONS and timeframe in ("M1", "M5", "M15", "M30", "H1") and all(ep):
+            sc = {"ASIA": T["asia"], "LON": T["london"], "NY": T["ny"]}
+            seg_start, seg_name = 0, _v294_session_of(time.gmtime(ep[0]).tm_hour)
+            for i in range(1, n + 1):
+                nm = _v294_session_of(time.gmtime(ep[i]).tm_hour) if i < n else "__end__"
+                if nm != seg_name:
+                    if seg_name:
+                        ax.axvspan(seg_start - 0.5, i - 0.5, color=sc[seg_name], alpha=0.045, linewidth=0, zorder=0)
+                        if i - seg_start >= 6:
+                            ax.text(seg_start + 0.3, 1.0, seg_name, transform=ax.get_xaxis_transform(), color=sc[seg_name],
+                                    fontsize=7, va="top", ha="left", alpha=0.9, fontweight="bold", zorder=1)
+                    seg_start, seg_name = i, (None if nm == "__end__" else nm)
+        if timeframe in ("M1", "M5", "M15", "M30", "H1", "H2") and all(ep):
+            prev_day = None
+            for i in range(n):
+                d = int((ep[i] + off_s) // 86400)
+                if prev_day is not None and d != prev_day:
+                    ax.axvline(i - 0.5, color=C["grid"], linewidth=0.9, linestyle=(0, (1, 3)), zorder=1)
+                prev_day = d
+    except Exception as exc:
+        print("V29.4 chart sessions:", type(exc).__name__, exc)
+
+    # ---------------- candles ----------------
+    ax.vlines(x, l, h, colors=col, linewidth=1.0, zorder=3)
+    ax.bar(x, np.maximum(np.abs(cl - o), rng * 0.0012), bottom=np.minimum(o, cl), width=0.72,
+           color=col, edgecolor=col, linewidth=0.5, zorder=4)
+
+    # ---------------- indicators (EMA 20/50/200, VWAP, Bollinger) ----------------
+    legend_items = []
+    closes_all = [float(c.close) for c in allc]
+    try:
+        if V29_TV_EMAS and len(allc) >= 30:
+            for period, color in ((20, C["orange"]), (50, C["blue"]), (200, T["ema200"])):
+                if len(allc) < min(period + 5, 60):
+                    continue
+                e = _v29_ema(closes_all, period)[-n:]
+                ax.plot(x, e, color=color, linewidth=1.15 if period != 200 else 1.0, alpha=0.92, zorder=2)
+                legend_items.append((f"EMA{period} {ff(e[-1])}", color))
+        if V294_TV_BB and len(allc) >= 25:
+            arr = np.array(closes_all)
+            mid, up_b, lo_b = [], [], []
+            for i in range(len(arr)):
+                w = arr[max(0, i - 19):i + 1]
+                m, s = float(w.mean()), float(w.std())
+                mid.append(m); up_b.append(m + 2 * s); lo_b.append(m - 2 * s)
+            ax.plot(x, up_b[-n:], color=T["bb"], linewidth=0.7, alpha=0.6, zorder=2)
+            ax.plot(x, lo_b[-n:], color=T["bb"], linewidth=0.7, alpha=0.6, zorder=2)
+            ax.fill_between(x, lo_b[-n:], up_b[-n:], color=T["bb"], alpha=0.05, zorder=1)
+        if has_vol and all(ep):
+            cum_pv = cum_v = 0.0
+            vw, cur_day = [], None
+            for i in range(n):
+                d = int((ep[i] + off_s) // 86400)
+                if d != cur_day:
+                    cum_pv = cum_v = 0.0
+                    cur_day = d
+                tp = (h[i] + l[i] + cl[i]) / 3.0
+                cum_pv += tp * vol[i]
+                cum_v += vol[i]
+                vw.append(cum_pv / cum_v if cum_v > 0 else tp)
+            ax.plot(x, vw, color=T["vwap"], linewidth=1.0, linestyle=(0, (5, 2)), alpha=0.9, zorder=2)
+            legend_items.append((f"VWAP {ff(vw[-1])}", T["vwap"]))
+    except Exception as exc:
+        print("V29.4 chart indicators:", type(exc).__name__, exc)
+
+    # ---------------- y range ----------------
+    ymin, ymax = float(l.min()), float(h.max())
+    span = ymax - ymin
+    plan = plan if isinstance(plan, dict) else {}
+    pvals = {k: float(plan[k]) for k in ("entry", "sl", "tp1", "tp2", "tp3")
+             if isinstance(plan.get(k), (int, float)) and math.isfinite(float(plan[k]))}
+    for v in pvals.values():
+        if ymin - 0.6 * span <= v <= ymax + 0.6 * span:
+            ymin, ymax = min(ymin, v), max(ymax, v)
+    pad = (ymax - ymin) * 0.07
+    ymin, ymax = ymin - pad, ymax + pad
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlim(-1.5, n + right_pad)
+    tags = []                                                        # (y, text, fg, bg)
+
+    # ---------------- market structure: swings, BOS/CHoCH, EQH/EQL, premium/discount ----------------
+    try:
+        if V294_TV_STRUCTURE and n >= 30:
+            labels, events, trend = _v294_structure(h, l, cl, left=3 if n >= 60 else 2)
+            for i, pr, t, tag in labels[-14:]:
+                if tag and ymin <= pr <= ymax:
+                    colr = C["up"] if tag in ("HH", "HL") else C["dn"]
+                    ax.text(i, pr + (atr * 0.28 if t == "H" else -atr * 0.28), tag, color=colr, fontsize=7.2,
+                            ha="center", va="bottom" if t == "H" else "top", fontweight="bold", alpha=0.95, zorder=8)
+            for kind, lvl, i0, i1, dr in events[-4:]:
+                if not (ymin <= lvl <= ymax):
+                    continue
+                cc = T["choch"] if kind == "CHoCH" else T["bos"]
+                ax.hlines(lvl, i0, i1, colors=cc, linewidth=1.0, linestyles=(0, (4, 3)), zorder=5)
+                ax.text((i0 + i1) / 2.0, lvl + (atr * 0.12 if dr == "UP" else -atr * 0.12), kind, color=cc, fontsize=7.4,
+                        ha="center", va="bottom" if dr == "UP" else "top", fontweight="bold", zorder=8)
+            tol = max(atr * 0.15, rng * 0.0004)
+            hi_p = [(i, pr) for i, pr, t, _tag in labels if t == "H"]
+            lo_p = [(i, pr) for i, pr, t, _tag in labels if t == "L"]
+            drawn = 0
+            for pts, nm, side in ((hi_p, "EQH", "H"), (lo_p, "EQL", "L")):
+                for a in range(len(pts) - 1, 0, -1):
+                    (i0, p0), (i1, p1) = pts[a - 1], pts[a]
+                    if abs(p0 - p1) <= tol and ymin <= p1 <= ymax and drawn < 4:
+                        ax.hlines((p0 + p1) / 2, i0, min(n + right_pad * 0.35, i1 + 8), colors=C["mute"], linewidth=0.9,
+                                  linestyles=(0, (1, 2)), zorder=5)
+                        ax.text(i1 + 0.4, (p0 + p1) / 2, nm, color=C["mute"], fontsize=7, va="bottom" if side == "H" else "top",
+                                ha="left", zorder=8, fontweight="bold")
+                        drawn += 1
+                        break
+            w = min(n, 80)
+            rhi, rlo = float(h[-w:].max()), float(l[-w:].min())
+            eq = (rhi + rlo) / 2.0
+            if ymin <= eq <= ymax:
+                ax.axhline(eq, color=T["eq"], linewidth=0.8, linestyle=(0, (6, 4)), alpha=0.7, zorder=2)
+                ax.axhspan(eq, min(rhi, ymax), color=C["dn"], alpha=0.025, linewidth=0, zorder=0)
+                ax.axhspan(max(rlo, ymin), eq, color=C["up"], alpha=0.025, linewidth=0, zorder=0)
+                ax.text(0.2, eq, "EQ 50%", color=T["eq"], fontsize=7, va="bottom", ha="left", alpha=0.9, zorder=6)
+                ax.text(0.2, min(rhi, ymax), "PREMIUM", color=C["dn"], fontsize=6.8, va="top", ha="left", alpha=0.55, zorder=6)
+                ax.text(0.2, max(rlo, ymin), "DISCOUNT", color=C["up"], fontsize=6.8, va="bottom", ha="left", alpha=0.55, zorder=6)
+            trend_txt = {1: ("Structure ▲ Bullish", C["up"]), -1: ("Structure ▼ Bearish", C["dn"])}.get(trend)
+            if trend_txt:
+                legend_items.append(trend_txt)
+    except Exception as exc:
+        print("V29.4 chart structure:", type(exc).__name__, exc)
+
+    # ---------------- zones (stop at mitigation) ----------------
+    zs = [z for z in (zones or []) if isinstance(z, dict) and z.get("high") is not None and z.get("low") is not None
+          and float(z["high"]) >= ymin and float(z["low"]) <= ymax]
+    zs.sort(key=lambda z: abs((float(z["low"]) + float(z["high"])) / 2 - live))
+    label_spots = []
+    for z in zs[:7]:
+        zlo, zhi = float(z["low"]), float(z["high"])
+        is_buy = str(z.get("direction")) == "BUY"
+        zc = C["zone_buy"] if is_buy else C["zone_sell"]
+        x0 = max(0, min(n - 1, int(z.get("index", n // 2))))
+        end, mitigated = n + right_pad * 0.55, False
+        for k in range(x0 + 2, n):                                   # first close through the zone = mitigated
+            if (is_buy and cl[k] < zlo) or ((not is_buy) and cl[k] > zhi):
+                end, mitigated = k + 0.5, True
+                break
+        zh = max(zhi - zlo, rng * 0.0008)
+        ax.add_patch(Rectangle((x0 - 0.5, zlo), end - x0 + 0.5, zh, facecolor=zc, alpha=0.07 if mitigated else 0.15,
+                               edgecolor=zc, linewidth=0.6, linestyle=(0, (3, 2)) if mitigated else "-", zorder=1))
+        if not mitigated:
+            ax.hlines((zlo + zhi) / 2, x0 - 0.5, end, colors=zc, linewidth=0.5, linestyles=(0, (1, 2)), alpha=0.7, zorder=1)
+        lx = min(x0, max(0, n - 16))
+        if all(abs(lx - ox) > 22 or abs(zhi - oy) > span * 0.035 for ox, oy in label_spots):
+            label_spots.append((lx, zhi))
+            ax.text(lx, zhi, " " + str(z.get("name", "")) + (" ✓" if mitigated else ""), color=zc, fontsize=7.6, va="bottom",
+                    ha="left", alpha=0.6 if mitigated else 0.98, zorder=5)
+
+    # ---------------- reference levels ----------------
+    for lv in (levels or []):
+        try:
+            p = float(lv["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (ymin <= p <= ymax):
+            continue
+        lc = lv.get("color") or C["mute"]
+        ax.axhline(p, color=lc, linewidth=0.8, linestyle=(0, (4, 4)), alpha=0.75, zorder=2)
+        tags.append((p, str(lv.get("name", "")), "white", lc))
+
+    # ---------------- Long / Short position tool ----------------
+    if "entry" in pvals and "sl" in pvals:
+        e, s = pvals["entry"], pvals["sl"]
+        tps = [pvals[k] for k in ("tp1", "tp2", "tp3") if k in pvals]
+        xs, xw = n - 1, right_pad - 3
+        is_long = (tps[0] > e) if tps else (s < e)
+        ax.add_patch(Rectangle((xs, min(e, s)), xw, abs(e - s), facecolor=C["dn"], alpha=0.20, linewidth=0, zorder=1))
+        if tps:
+            far = max(tps, key=lambda v: abs(v - e))
+            ax.add_patch(Rectangle((xs, min(e, far)), xw, abs(far - e), facecolor=C["up"], alpha=0.16, linewidth=0, zorder=1))
+        ax.hlines(e, xs, xs + xw, colors=C["blue"], linewidth=1.5, zorder=6)
+        ax.hlines(s, xs, xs + xw, colors=C["dn"], linewidth=1.2, linestyles="--", zorder=6)
+        tags.append((e, ("LONG " if is_long else "SHORT ") + ff(e), "white", C["blue"]))
+        tags.append((s, "SL " + ff(s), "white", C["dn"]))
+        ax.text(xs + 0.3, s, f" -{abs(e - s):,.{dec}f} · {abs(e - s) / max(abs(e), 1e-9) * 100:.2f}%", color=C["dn"],
+                fontsize=7.2, va="top" if s < e else "bottom", ha="left", zorder=7)
+        for i, k in enumerate(("tp1", "tp2", "tp3"), 1):
+            if k in pvals:
+                ax.hlines(pvals[k], xs, xs + xw, colors=C["up"], linewidth=1.1, linestyles="--" if i == 1 else ":", zorder=6)
+                tags.append((pvals[k], f"TP{i} " + ff(pvals[k]), "white", C["up"]))
+                ax.text(xs + 0.3, pvals[k], f" +{abs(pvals[k] - e):,.{dec}f} · {abs(pvals[k] - e) / max(abs(e), 1e-9) * 100:.2f}%",
+                        color=C["up"], fontsize=7.2, va="bottom" if pvals[k] > e else "top", ha="left", zorder=7)
+        risk = abs(e - s)
+        if risk > 0 and tps:
+            ax.text(xs + xw - 0.3, (e + tps[0]) / 2, f"RR 1:{abs(tps[0] - e) / risk:.1f} ", color=C["up"], fontsize=8.5,
+                    fontweight="bold", va="center", ha="right", zorder=7)
+
+    # ---------------- last price line + tag (+ candle countdown) ----------------
+    lc = C["up"] if cl[-1] >= o[-1] else C["dn"]
+    ax.axhline(live, color=lc, linewidth=0.8, linestyle=(0, (2, 2)), alpha=0.8, zorder=2)
+    tag_txt = ff(live)
+    if ep[-1] and 0 <= time.time() - ep[-1] < tf_sec:
+        left = int(tf_sec - (time.time() - ep[-1]))
+        tag_txt += f"\n{left // 60:02d}:{left % 60:02d}" if left < 3600 else f"\n{left // 3600}h{(left % 3600) // 60:02d}"
+    tags.append((live, tag_txt, "white", lc))
+    sep = (ymax - ymin) * 0.03
+    placed, last_y = [], None
+    for y, txt, fg, bg in sorted(tags, key=lambda t: t[0]):
+        yy = y if last_y is None or y - last_y >= sep else last_y + sep
+        last_y = yy
+        placed.append((yy, txt, fg, bg))
+    for yy, txt, fg, bg in placed:
+        ax.text(1.002, yy, " " + txt.replace("\n", " \n ") + " ", transform=ax.get_yaxis_transform(), ha="left", va="center",
+                fontsize=8.4, color=fg, fontweight="bold", clip_on=False, zorder=10,
+                bbox=dict(boxstyle="square,pad=0.25", fc=bg, ec="none"))
+
+    # ---------------- volume panel ----------------
+    rsi_last = None
+    try:
+        if has_vol:
+            av = axes["vol"]
+            av.bar(x, vol, width=0.72, color=[T["vol_up"] if u else T["vol_dn"] for u in up], alpha=0.55, linewidth=0, zorder=3)
+            vall = np.array([float(v or 0) for v in vol_all], dtype=float)
+            ma = np.array([vall[max(0, i - 19):i + 1].mean() for i in range(len(vall))])[-n:]
+            av.plot(x, ma, color=C["orange"], linewidth=0.9, alpha=0.9, zorder=4)
+            av.set_ylim(0, max(float(vol.max()), float(ma.max())) * 1.25 or 1.0)
+            av.text(0.006, 0.93, f"Volume  {_v294_fmt_vol(vol[-1])}   MA20 {_v294_fmt_vol(ma[-1])}", transform=av.transAxes,
+                    color=C["mute"], fontsize=7.6, va="top", ha="left")
+            legend_items.append((f"Vol {_v294_fmt_vol(vol[-1])}", C["mute"]))
+        if has_rsi:
+            ar = axes["rsi"]
+            rs = _v294_rsi(closes_all, 14)[-n:]
+            xr = np.array([i for i, v in enumerate(rs) if v is not None])
+            yr = np.array([v for v in rs if v is not None])
+            if len(yr) >= 2:
+                ar.axhspan(30, 70, color=T["rsi"], alpha=0.06, linewidth=0)
+                for lvl_, sty in ((70, (0, (3, 3))), (50, (0, (1, 3))), (30, (0, (3, 3)))):
+                    ar.axhline(lvl_, color=C["grid"] if lvl_ == 50 else C["mute"], linewidth=0.7, linestyle=sty, alpha=0.8)
+                ar.plot(xr, yr, color=T["rsi"], linewidth=1.2, zorder=4)
+                ar.fill_between(xr, yr, 50, where=yr >= 50, color=C["up"], alpha=0.08, linewidth=0)
+                ar.fill_between(xr, yr, 50, where=yr < 50, color=C["dn"], alpha=0.08, linewidth=0)
+                ar.set_ylim(0, 100)
+                ar.set_yticks([30, 50, 70])
+                rsi_last = float(yr[-1])
+                rc = C["dn"] if rsi_last >= 70 else (C["up"] if rsi_last <= 30 else T["rsi"])
+                ar.text(0.006, 0.93, f"RSI 14  {rsi_last:.1f}", transform=ar.transAxes, color=rc, fontsize=7.8, va="top", ha="left",
+                        fontweight="bold")
+                ar.text(1.002, rsi_last / 100.0, f" {rsi_last:.1f} ", transform=ar.transAxes,
+                        ha="left", va="center", fontsize=7.8, color="white", fontweight="bold", clip_on=False,
+                        bbox=dict(boxstyle="square,pad=0.22", fc=T["rsi"], ec="none"))
+    except Exception as exc:
+        print("V29.4 chart sub-panels:", type(exc).__name__, exc)
+
+    # ---------------- axes styling ----------------
+    bottom_ax = axes[panels[-1]]
+    try:
+        yt = [t for t in ax.get_yticks() if ymin <= t <= ymax and all(abs(t - yy) > sep * 0.9 for yy, _t, _f, _b in placed)]
+        ax.set_yticks(yt)
+    except Exception:
+        pass
+    for name, a in axes.items():
+        a.yaxis.tick_right()
+        a.tick_params(axis="y", colors=C["text"] if name == "price" else C["mute"], labelsize=9 if name == "price" else 7.6,
+                      length=0, pad=8)
+        a.tick_params(axis="x", colors=C["mute"], labelsize=8.5, length=0, pad=6, labelbottom=(a is bottom_ax))
+        for sp in ("top", "left"):
+            a.spines[sp].set_visible(False)
+        for sp in ("bottom", "right"):
+            a.spines[sp].set_color(C["grid"])
+        a.grid(True, color=C["grid"], linewidth=0.6, alpha=0.7)
+        a.set_axisbelow(True)
+    ax.set_xlim(-1.5, n + right_pad)
+    step = max(1, n // 8)
+    ticks, labels_x, prev = [], [], None
+    for i in range(0, n, step):
+        if not ep[i]:
+            continue
+        g = time.gmtime(ep[i] + off_s)
+        newday = prev is None or g.tm_yday != time.gmtime(ep[prev] + off_s).tm_yday
+        labels_x.append(time.strftime("%d %b", g) if (newday or timeframe in ("H2", "H4")) else time.strftime("%H:%M", g))
+        ticks.append(i)
+        prev = i
+    bottom_ax.set_xticks(ticks)
+    bottom_ax.set_xticklabels(labels_x)
+    ax.text(0.5, 0.5, f"{symbol}, {_V29_TF_LABEL.get(timeframe, timeframe)}", transform=ax.transAxes, ha="center", va="center",
+            fontsize=58, color="white", alpha=0.03, fontweight="bold", zorder=0)
+
+    # ---------------- header (legend) ----------------
+    chg = cl[-1] - o[-1]
+    hc = C["up"] if chg >= 0 else C["dn"]
+    fig.text(0.014, 0.958, f"{symbol}  ·  {_V29_TF_LABEL.get(timeframe, timeframe)}  ·  {source}", color=C["text"],
+             fontsize=13, fontweight="bold", va="center")
+    age = time.time() - ep[-1] if ep[-1] else None
+    crypto = symbol in ("BTCUSD", "ETHUSD")
+    live_ok = crypto or (age is not None and age <= max(3 * tf_sec, 900))
+    fig.text(0.40, 0.958, "● LIVE" if live_ok else "● CLOSED", color=C["up"] if live_ok else C["dn"], fontsize=9.5,
+             fontweight="bold", va="center")
+    if _v294_weekend() and symbol in WEEKEND_BTC_SYMBOLS:
+        fig.text(0.47, 0.958, " WEEKEND · BTC 24/7 ", color="black", fontsize=8.4, fontweight="bold", va="center",
+                 bbox=dict(boxstyle="round,pad=0.25", fc=T["weekend"], ec="none"))
+    fig.text(0.014, 0.924, f"O {ff(o[-1])}   H {ff(h[-1])}   L {ff(l[-1])}   C {ff(cl[-1])}   "
+                           f"{chg:+.{dec}f} ({chg / max(abs(o[-1]), 1e-9) * 100:+.2f}%)   ATR {ff(atr)}", color=hc, fontsize=9.5, va="center")
+    xx, yy_ = 0.014, 0.893
+    for txt, color in legend_items:
+        if xx > 0.80:
+            xx, yy_ = 0.014, yy_ - 0.024
+        fig.text(xx, yy_, txt, color=color, fontsize=8.4, va="center")
+        xx += 0.011 + 0.0068 * len(txt)
+    fig.text(0.915, 0.958, "MATHAZZ AI PRO", color=C["blue"], fontsize=12, fontweight="bold", ha="right", va="center")
+    fig.text(0.915, 0.928, "Deriv market data" if str(source).startswith("Deriv") else str(source), color=C["mute"],
+             fontsize=8, ha="right", va="center")
+    fig.text(0.014, 0.022, (footer or "Render only · Entry/SL/TP come from the Python engine, not from this drawing") + f"  ·  {tz_txt}",
+             color=C["mute"], fontsize=7.8, va="center")
+    out_dir = os.environ.get("LYLI_CHART_DIR") or _DB_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    if not path:
+        path = os.path.join(out_dir, f"lyli_tv_{symbol}_{timeframe}_{int(time.time() * 1000)}.png")
+    fig.savefig(path, dpi=140, facecolor=C["bg"])
+    plt.close(fig)
+    _v29_clean_old_charts(out_dir)
+    return path
+
+
+_V294_PREV_TV_RENDER = _v29_tv_render_locked
+
+
+def _v29_tv_render_locked(symbol, timeframe, candles, source="Deriv", live_price=None, plan=None,
+                          zones=None, levels=None, footer="", path=None, max_candles=None):
+    """V29.4 pro chart; the V29.3 renderer is the automatic fallback."""
+    try:
+        return _v294_tv_render_locked(symbol, timeframe, candles, source, live_price, plan, zones, levels, footer, path,
+                                      max_candles)
+    except ImportError:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        print("V29.4 pro chart failed -> V29.3 renderer:", type(exc).__name__, exc)
+        try:
+            import matplotlib.pyplot as _plt
+            _plt.close("all")
+        except Exception:
+            pass
+        return _V294_PREV_TV_RENDER(symbol, timeframe, candles, source, live_price, plan, zones, levels, footer, path,
+                                    max_candles)
+
+
+
+BUILD_VERSION = "V29.4 PRO CHART + WEEKEND BTC · V29.3 PHOTO+CAPTION DASHBOARD · V29.2 IMAGE CHART ATTACHED · V29.1 ALERT RECOVERY · DERIV PRIMARY DATA · IMAGE ANALYSIS PRO · LILY TRADINGVIEW-STYLE CHART"
+BUILD_LOG = [("V29.4", "Pro TradingView chart (volume + RSI panels, EMA20/50/200, VWAP, sessions, HH/HL/LH/LL, BOS/CHoCH, EQH/EQL, Premium/Discount, mitigated zones, position tool with %/RR, LIVE/CLOSED chip). Weekend Mode: Instant + Analyze Alert auto-add BTCUSD while Forex/Gold is closed (Sat/Sun), skip CLOSED symbols, weekend notice once per chat, BTC first in symbol menus")] + [("V29.3", "Image Analyze: dashboard is one photo message (TradingView-style chart + short caption + buttons); full text in Details; text dashboard kept as fallback")] + [("V29.2", "Image Analyze: Deriv TradingView-style chart is sent as a reply attached to the dashboard card with Entry/SL/TP caption; visible error note if it fails")] + [("V29.1", "Alert recovery: ICT PRO outer worker marked + never exits; watchdog restarts dead Analyze/ICT/ICT PRO/Instant workers and prints Deriv health; DERIV_CANDLES_BG_SHARE configurable (0.8)")] + [("V29", "Deriv is now the PRIMARY candle + price source (ticks_history candles over a persistent socket, incremental refresh, paced under "
                      "the Deriv limit, Yahoo = labelled fallback; ICT/ICT PRO/Scan Zone scanners stay Yahoo-only unless DERIV_CANDLES_SCANNERS=1). "
                      "Lily snapshot, advisor and /chart use Deriv; chart redrawn in TradingView style (right price scale, last-price tag + countdown, "
                      "OB/FVG zones, PDH/PDL/Asia, EMA 20/50, Long/Short boxes). Analyze Pic: Deriv Verification of screenshot facts "
