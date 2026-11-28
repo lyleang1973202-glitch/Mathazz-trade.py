@@ -23081,8 +23081,303 @@ def handle_update(update):
     return _V29_PREV_HANDLE_UPDATE(update)
 
 
-BUILD_VERSION = "V29 DERIV PRIMARY DATA · IMAGE ANALYSIS PRO (DERIV VERIFY) · LILY TRADINGVIEW-STYLE CHART"
-BUILD_LOG = [("V29", "Deriv is now the PRIMARY candle + price source (ticks_history candles over a persistent socket, incremental refresh, paced under "
+# =============================================================================
+# V29.1 HOTFIX · ALERT RECOVERY  (Analyze · ICT/Scan Zone · ICT PRO · Instant)
+#
+# What was verified in the V29 source
+#   1) V28.3 re-defined _pro_alert_worker_legacy() AFTER V28 had wrapped it with _v28_worker(), so the
+#      outer ICT PRO loop ran un-marked and, if the inner worker ever returned, spun with no sleep.
+#   2) Nothing restarted an alert worker thread once it died, so one fatal error = that alert stays silent
+#      until the next Railway redeploy (/alertcheck then shows "Worker ❌").
+#   3) V29 gave Analyze/Instant/radar only 60% of 45 Deriv candle requests/min (= 27/min) for 6 symbols x 7
+#      timeframes. The budget ran dry within seconds, so most alert scans silently dropped to Yahoo.
+#
+# FIX (additive, no engine logic changed)
+#   * ICT PRO outer loop is marked as an alert worker again, never exits and sleeps between restarts.
+#   * Watchdog: every 60 s every alert worker thread is checked; a dead one is started again and logged.
+#     A one-line health print every 5 min shows Deriv link/budget so a silent alert can be diagnosed.
+#   * Background Deriv candle share is now configurable (DERIV_CANDLES_BG_SHARE, default 0.8).
+# =============================================================================
+DERIV_CANDLES_BG_SHARE = max(0.3, min(0.95, float(os.environ.get("DERIV_CANDLES_BG_SHARE") or 0.8)))
+
+_V291_PRO_OUTER = _pro_alert_worker_legacy
+
+
+def _pro_alert_worker_legacy():
+    while True:
+        try:
+            _TG_CTX.v = {"alert_worker": True, "worker": "ictpro"}
+            _V291_PRO_OUTER()
+        except Exception as exc:
+            print("V29.1 ICT PRO worker error (restarting in 5s):", type(exc).__name__, exc)
+        time.sleep(5)
+
+
+_V291_WATCH = (
+    ("scanzone-alerts", "_pro_alert_worker"),                       # ICT / Scan Zone
+    ("ict-structure-alerts", "_pro_alert_worker_legacy"),           # ICT PRO
+    ("mathazz-v10-2-swing-assistant", "_analyze_swing_alert_worker"),  # Analyze
+    ("instant-monitor", "_instant_monitor_worker"),                 # Instant lifecycle
+    ("instant-price-alert", "_instant_price_alert_worker"),         # Instant one-shot price alert
+)
+
+
+def _v291_watchdog():
+    time.sleep(90)                                   # main() starts the workers first
+    last_health = 0.0
+    while True:
+        try:
+            alive = {t.name for t in threading.enumerate() if t.is_alive()}
+            for name, fn_name in _V291_WATCH:
+                if name in alive:
+                    continue
+                fn = globals().get(fn_name)
+                if callable(fn):
+                    threading.Thread(target=fn, name=name, daemon=True).start()
+                    print(f"V29.1 WATCHDOG: alert worker '{name}' was dead -> restarted")
+            if time.time() - last_health > 300:
+                last_health = time.time()
+                cl = _DVC_CLIENT
+                print(f"V29.1 alert health · workers alive="
+                      f"{sum(1 for n, _ in _V291_WATCH if n in alive)}/{len(_V291_WATCH)} · "
+                      f"Deriv link={cl.status} budget={cl.per_minute_used()}/{DERIV_CANDLES_PER_MIN} "
+                      f"ok={cl.n_ok} err={cl.n_err} last_err={cl.last_err[:80] or 'none'}")
+        except Exception as exc:
+            print("V29.1 watchdog error:", type(exc).__name__, exc)
+        time.sleep(60)
+
+
+_V291_PREV_MAIN = main
+
+
+def main():
+    threading.Thread(target=_v291_watchdog, name="v291-alert-watchdog", daemon=True).start()
+    return _V291_PREV_MAIN()
+
+
+# =============================================================================
+# V29.2 · IMAGE ANALYZE: TRADINGVIEW-STYLE CHART ATTACHED TO THE DASHBOARD
+#   * The Deriv TradingView-style chart is now sent as a REPLY to the dashboard card (visually attached
+#     directly under it, same Topic) with a compact plan caption (bias · Entry/SL/TP · Deriv Verify).
+#   * Failures are visible (short note under the card) instead of only a console log.
+# =============================================================================
+def _v292_upload_photo(chat_id, path, caption, thread_id=None, reply_to=None):
+    boundary = "----V292Boundary" + str(int(time.time() * 1000))
+    fields = {"chat_id": str(chat_id), "parse_mode": "HTML"}
+    if thread_id is not None:
+        fields["message_thread_id"] = str(thread_id)
+    if reply_to:
+        fields["reply_to_message_id"] = str(reply_to)
+        fields["allow_sending_without_reply"] = "true"
+    if caption:
+        fields["caption"] = str(caption)[:1024]
+    body = bytearray()
+    for k, v in fields.items():
+        body.extend(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    with open(path, "rb") as f:
+        data = f.read()
+    body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="{os.path.basename(path)}"\r\n'
+                 f'Content-Type: image/png\r\n\r\n').encode())
+    body.extend(data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendPhoto", data=bytes(body),
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if not res.get("ok"):
+            print("V29.2 chart upload rejected:", res)
+        return res
+    except Exception as exc:
+        print("V29.2 chart upload failed:", type(exc).__name__, exc)
+        return None
+
+
+def _v292_card_msg_id(chat_id):
+    try:
+        for k in reversed(list(RESULTS.keys())):
+            if k[0] == chat_id:
+                return k[1]
+    except Exception:
+        pass
+    return None
+
+
+def _v29_send_verified_chart(chat_id, symbol, ctf, candles, live, plan, confirmed_zones, ver, src_name):
+    """Deriv TradingView-style chart, sent as a reply attached to the Image Analyze dashboard card."""
+    ctx = getattr(_TG_CTX, "v", None) or {}
+    thread_id = ctx.get("thread_id")
+    reply_to = _v292_card_msg_id(chat_id)
+    try:
+        vis = list(candles)[-V29_TV_CANDLES:]
+        off = len(candles) - len(vis)
+        payload = _lyli_zone_payload(vis, live)
+        zones = [{"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"], "index": z["index"]}
+                 for z in payload.get("zones", [])[-5:]]
+        for z in confirmed_zones:
+            zones.append({"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"],
+                          "index": max(0, z.get("abs_index", off) - off)})
+        levels = [{"name": ("Range High" if "High" in lv["name"] else "Range Low"), "price": lv["price"]}
+                  for lv in payload.get("levels", []) if "Range" in lv["name"]]
+        levels += _v29_day_level_rows(symbol, live)
+        foot = "Image Analysis · IMG = zone read from your screenshot and confirmed on Deriv candles"
+        path = _v29_tv_render(symbol, ctf, candles, src_name, live, plan, zones, levels, footer=foot)
+        dec = SYMBOLS_MAP.get(symbol, {}).get("decimals", 2)
+        cap = [f"📊 <b>{html.escape(str(symbol))} {html.escape(str(ctf))}</b> · TradingView-style · {html.escape(str(src_name))}"]
+        if plan:
+            cap.append(f"📍 Entry <code>{fmt(plan['entry'], dec)}</code> · 🛑 SL <code>{fmt(plan['sl'], dec)}</code>\n"
+                       f"✅ TP1 <code>{fmt(plan['tp1'], dec)}</code> · TP2 <code>{fmt(plan['tp2'], dec)}</code> · "
+                       f"🏆 TP3 <code>{fmt(plan['tp3'], dec)}</code>")
+        else:
+            cap.append("មិនមាន Trade Plan · បង្ហាញតែ Zone/Level ដែលបានផ្ទៀងផ្ទាត់")
+        if ver and ver.get("score") is not None:
+            cap.append(f"🔎 Deriv Verify {ver['score']}/100")
+        cap.append("⬆️ Chart នេះភ្ជាប់ជាមួយ Dashboard ខាងលើ")
+        res = _v292_upload_photo(chat_id, path, "\n".join(cap), thread_id, reply_to)
+        if not (res and res.get("ok")):
+            raise RuntimeError("sendPhoto failed")
+    except ImportError:
+        print("V29.2 chart skipped: matplotlib not installed (add matplotlib to requirements.txt)")
+        tg("sendMessage", chat_id=chat_id, reply_to_message_id=reply_to, allow_sending_without_reply=True,
+           text="⚠️ Chart មិនអាចបង្កើតបាន៖ matplotlib មិនទាន់ដំឡើង (requirements.txt)")
+    except Exception as exc:
+        traceback.print_exc()
+        print("V29.2 chart failed:", type(exc).__name__, exc)
+        tg("sendMessage", chat_id=chat_id, reply_to_message_id=reply_to, allow_sending_without_reply=True,
+           text=f"⚠️ Chart មិនអាចបង្កើត/ផ្ញើបាន ({html.escape(type(exc).__name__)})")
+
+
+# =============================================================================
+# V29.3 · IMAGE ANALYZE: ONE MESSAGE = TradingView-style chart (photo) + short dashboard (caption) + buttons
+#   * The long text dashboard is replaced by a single photo message: chart on top, a <=1024-char caption
+#     (signal, bias/ICT score, Entry/SL/TP, sync) and the same buttons. Full text stays in 📋 Details.
+#   * If the chart cannot be produced the original text dashboard stays untouched (fallback).
+#   * Buttons on a photo message cannot edit text, so they are routed to send new messages instead.
+# =============================================================================
+_V293_PHOTO_CARDS = set()          # (chat_id, message_id) of dashboards that are now photo messages
+
+
+def _v293_upload_photo(chat_id, path, caption, thread_id=None, markup=None):
+    boundary = "----V293Boundary" + str(int(time.time() * 1000))
+    fields = {"chat_id": str(chat_id), "parse_mode": "HTML", "caption": str(caption)[:1024]}
+    if thread_id is not None:
+        fields["message_thread_id"] = str(thread_id)
+    if markup:
+        fields["reply_markup"] = json.dumps(markup)
+    body = bytearray()
+    for k, v in fields.items():
+        body.extend(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    with open(path, "rb") as f:
+        data = f.read()
+    body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="{os.path.basename(path)}"\r\n'
+                 f'Content-Type: image/png\r\n\r\n').encode())
+    body.extend(data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendPhoto", data=bytes(body),
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if not res.get("ok"):
+            print("V29.3 chart upload rejected:", res)
+        return res
+    except Exception as exc:
+        print("V29.3 chart upload failed:", type(exc).__name__, exc)
+        return None
+
+
+def _v293_caption(card, limit=1000):
+    """Short caption from the full card: header lines + Entry/SL/TP block + price-sync + ICT lines (whole lines only,
+    so the HTML stays balanced)."""
+    lines = str(card).split("\n")
+    head, plan_blk, sync, ict = lines[:4], [], [], []
+    i = 4
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("<pre>"):
+            j = i
+            while j < len(lines) and "</pre>" not in lines[j]:
+                j += 1
+            plan_blk = lines[i:j + 1]
+            i = j
+        elif ln.startswith("💵") and not sync:
+            sync = [ln]
+        elif ln.startswith("🧱") and not ict:
+            ict = [ln]
+        i += 1
+    tail = ["📋 ព័ត៌មានពេញ → ចុច Details"]
+    for parts in (head + plan_blk + sync + ict, head + plan_blk + sync, head + plan_blk, head):
+        cap = "\n".join(parts + tail)
+        if len(cap) <= limit:
+            return cap
+    return "\n".join(head[:2] + tail)[:limit]
+
+
+def _v29_send_verified_chart(chat_id, symbol, ctf, candles, live, plan, confirmed_zones, ver, src_name):
+    ctx = getattr(_TG_CTX, "v", None) or {}
+    thread_id = ctx.get("thread_id")
+    card_id = _v292_card_msg_id(chat_id)
+    rec = RESULTS.get((chat_id, card_id)) if card_id else None
+    try:
+        vis = list(candles)[-V29_TV_CANDLES:]
+        off = len(candles) - len(vis)
+        payload = _lyli_zone_payload(vis, live)
+        zones = [{"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"], "index": z["index"]}
+                 for z in payload.get("zones", [])[-5:]]
+        for z in confirmed_zones:
+            zones.append({"name": z["name"], "direction": z["direction"], "low": z["low"], "high": z["high"],
+                          "index": max(0, z.get("abs_index", off) - off)})
+        levels = [{"name": ("Range High" if "High" in lv["name"] else "Range Low"), "price": lv["price"]}
+                  for lv in payload.get("levels", []) if "Range" in lv["name"]]
+        levels += _v29_day_level_rows(symbol, live)
+        foot = "Image Analysis · IMG = zone read from your screenshot and confirmed on Deriv candles"
+        path = _v29_tv_render(symbol, ctf, candles, src_name, live, plan, zones, levels, footer=foot)
+        if rec:
+            caption = _v293_caption(rec["card"])
+        else:
+            caption = f"📊 <b>{html.escape(str(symbol))} {html.escape(str(ctf))}</b> · TradingView-style · {html.escape(str(src_name))}"
+        res = _v293_upload_photo(chat_id, path, caption, thread_id, ai_buttons(symbol))
+        if not (res and res.get("ok")):
+            raise RuntimeError("sendPhoto failed")
+        new_id = res["result"]["message_id"]
+        if rec:
+            RESULTS[(chat_id, new_id)] = dict(rec)
+        _V293_PHOTO_CARDS.add((chat_id, new_id))
+        if len(_V293_PHOTO_CARDS) > 300:
+            _V293_PHOTO_CARDS.pop()
+        if card_id and rec:                               # photo replaces the long text dashboard
+            tg("deleteMessage", chat_id=chat_id, message_id=card_id)
+    except ImportError:
+        print("V29.3 chart skipped: matplotlib not installed (add matplotlib to requirements.txt)")
+        tg("sendMessage", chat_id=chat_id, text="⚠️ Chart មិនអាចបង្កើតបាន៖ matplotlib មិនទាន់ដំឡើង · Dashboard អត្ថបទនៅដដែល")
+    except Exception as exc:
+        traceback.print_exc()
+        print("V29.3 chart failed:", type(exc).__name__, exc)
+        tg("sendMessage", chat_id=chat_id, text=f"⚠️ Chart មិនអាចបង្កើត/ផ្ញើបាន ({html.escape(type(exc).__name__)}) · Dashboard អត្ថបទនៅដដែល")
+
+
+_V293_PREV_HANDLE_CALLBACK = handle_callback
+
+
+def handle_callback(chat_id, msg_id, data, user_id=None):
+    if (chat_id, msg_id) in _V293_PHOTO_CARDS:
+        if data == "aid_d":                               # Details: new text message(s) under the photo
+            r = RESULTS.get((chat_id, msg_id))
+            if not r:
+                tg("sendMessage", chat_id=chat_id, text="Result expired. Please send the chart again.",
+                   reply_markup=kb([[("🏠 Menu", "menu_main")]]))
+                return
+            parts = split_text(_compact_details_text(r["details"], 16, 2800))
+            for n, part in enumerate(parts):
+                tg("sendMessage", chat_id=chat_id, text=part,
+                   reply_markup=kb([[("🏠 Menu", "menu_main")]]) if n == len(parts) - 1 else None)
+            return
+        msg_id = None                                     # other buttons: send fresh messages (photo cannot be text-edited)
+    return _V293_PREV_HANDLE_CALLBACK(chat_id, msg_id, data, user_id)
+
+
+BUILD_VERSION = "V29.3 PHOTO+CAPTION DASHBOARD · V29.2 IMAGE CHART ATTACHED · V29.1 ALERT RECOVERY · DERIV PRIMARY DATA · IMAGE ANALYSIS PRO · LILY TRADINGVIEW-STYLE CHART"
+BUILD_LOG = [("V29.3", "Image Analyze: dashboard is one photo message (TradingView-style chart + short caption + buttons); full text in Details; text dashboard kept as fallback")] + [("V29.2", "Image Analyze: Deriv TradingView-style chart is sent as a reply attached to the dashboard card with Entry/SL/TP caption; visible error note if it fails")] + [("V29.1", "Alert recovery: ICT PRO outer worker marked + never exits; watchdog restarts dead Analyze/ICT/ICT PRO/Instant workers and prints Deriv health; DERIV_CANDLES_BG_SHARE configurable (0.8)")] + [("V29", "Deriv is now the PRIMARY candle + price source (ticks_history candles over a persistent socket, incremental refresh, paced under "
                      "the Deriv limit, Yahoo = labelled fallback; ICT/ICT PRO/Scan Zone scanners stay Yahoo-only unless DERIV_CANDLES_SCANNERS=1). "
                      "Lily snapshot, advisor and /chart use Deriv; chart redrawn in TradingView style (right price scale, last-price tag + countdown, "
                      "OB/FVG zones, PDH/PDL/Asia, EMA 20/50, Long/Short boxes). Analyze Pic: Deriv Verification of screenshot facts "
